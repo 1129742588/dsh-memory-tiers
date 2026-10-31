@@ -1,0 +1,30 @@
+# 依赖与打包产物
+node_modules/
+dist/
+*.tgz
+
+# 模拟/测试产生的数据（体积大，可随时重建）
+.big
+.big-*/
+.big.lock
+.sim/
+.sim*/
+.test*/
+.dataset.json
+
+# 旧版本与一次性脚本（保留在本地，不对外发布）
+memory.mjs
+memory4.mjs
+README4.md
+test.mjs
+test4.mjs
+test5.mjs
+simulate.mjs
+sf_models.json
+_lm_export.json
+_*.py
+
+# 系统与编辑器
+.DS_Store
+Thumbs.db
+*.log
