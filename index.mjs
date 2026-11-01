@@ -20,6 +20,7 @@ import { join } from 'node:path'
 import { createMemory5, LAYER, DEFAULTS as MEM_DEFAULTS } from './memory5.mjs'
 import { createSilicon, keyFromAstrbot } from './silicon.mjs'
 import { compactSurface } from './compaction.mjs'
+import { installSettingsApi } from './settings.mjs'
 
 export const name = 'memory-tiers'
 export const inject = ['tools']
@@ -547,6 +548,18 @@ export function apply(ctx, config = {}) {
     }
     log.info?.('[memory-tiers] 已加载，注册 %d 个工具（语义=%s，自动捕获=%s）',
       toolCount, !!silicon, cfg.autoCapture !== false)
+  })
+
+  // ── 设置页的服务端接口：读写 config.json（前端见 client.mjs） ──
+  //    webServer 可能比插件晚就绪，用 inject 等它，而不是直接读 ctx.webServer。
+  ctx.inject(['webServer'], (c) => {
+    const off = installSettingsApi(c, { dir, getCfg: () => cfg, log, mem })
+    if (typeof off === 'function') {
+      try { c.effect(() => off, 'memory-tiers: settings api') } catch { /* 老版本没有 effect 也不影响接口可用 */ }
+    } else {
+      log.warn?.('[memory-tiers] webServer 不可用，设置页接口没挂上')
+    }
+    log.info?.('[memory-tiers] 设置页接口已挂：/dsh-memory/api/settings')
   })
 
   // ── 斜杠命令：手动查看/维护入口 ──

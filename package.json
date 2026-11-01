@@ -1,11 +1,17 @@
 {
   "name": "dsh-memory-tiers",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "六层记忆插件：L1/L2/L3 活跃层 + DL1/DL2/DL3 深层，自动捕获写入、摘要沉淀、按需召回，并接管历史压缩（零 LLM）。",
   "type": "module",
   "main": "index.mjs",
   "license": "MIT",
-  "keywords": ["dsh", "dsh-plugin", "memory", "compaction", "context"],
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "memory",
+    "compaction",
+    "context"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/1129742588/dsh-memory-tiers.git"
@@ -17,10 +23,15 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
     }
   },
   "exports": {
     ".": "./index.mjs",
+    "./client": "./client.mjs",
     "./compaction.mjs": "./compaction.mjs",
     "./memory5.mjs": "./memory5.mjs",
     "./cordis.patch.yml": "./cordis.patch.yml",
@@ -28,6 +39,8 @@
   },
   "files": [
     "index.mjs",
+    "client.mjs",
+    "settings.mjs",
     "compaction.mjs",
     "memory5.mjs",
     "silicon.mjs",
