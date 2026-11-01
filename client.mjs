@@ -43,6 +43,7 @@ window.__ModuleLoader__.load({
       '.dmt-btn:disabled{opacity:.5;cursor:default}',
       '.dmt-msg{font-size:12.5px;line-height:18px}',
       '.dmt-msg.dmt-ok{color:var(--dsw-alias-label-success,#3b6d11)}',
+      '.dmt-msg.dmt-warn{color:var(--dsw-alias-label-warning,#854f0b)}',
       '.dmt-msg.dmt-err{color:var(--dsw-alias-label-danger,#a32d2d)}',
       '.dmt-stats{display:flex;gap:18px;flex-wrap:wrap;margin-top:8px}',
       '.dmt-stat{min-width:92px}',
@@ -82,7 +83,7 @@ window.__ModuleLoader__.load({
         label: 'API Key',
         type: 'password',
         wide: true,
-        hint: '硅基流动的 key。留空则用本地哈希向量——能跑，但语义检索会弱很多。改完需重启。',
+        hint: '不填就没有语义检索（只走关键词命中，也没有摘要）。本插件不再用本地哈希向量充数。改完需重启。',
       },
       {
         group: '模型连接',
@@ -251,7 +252,7 @@ window.__ModuleLoader__.load({
           className: 'dmt-input' + (field.wide ? ' dmt-wide' : ''),
           type: kind === 'number' ? 'number' : kind === 'password' ? 'password' : 'text',
           value: value === undefined || value === null ? '' : String(value),
-          placeholder: kind === 'password' ? '留空则用本地哈希向量' : '',
+          placeholder: kind === 'password' ? '不填就不启用语义检索' : '',
           onChange: (e) => onChange(kind === 'number' ? (e.target.value === '' ? '' : Number(e.target.value)) : e.target.value),
         })
       }
@@ -346,9 +347,17 @@ window.__ModuleLoader__.load({
         h('div', { className: 'dmt-row' },
           h('div', null,
             h('div', { className: 'dmt-label' }, '语义检索'),
-            h('div', { className: 'dmt-hint' }, live?.semantic ? '已接真模型' : '未配置 key，当前用本地哈希向量，关键词匹配为主'),
+            h('div', { className: 'dmt-hint' }, live?.semantic
+              ? '已接真模型'
+              : '未连接模型：语义检索关闭，只按关键词命中（没有假向量）'),
           ),
-          h('div', { className: 'dmt-msg ' + (live?.semantic ? 'dmt-ok' : '') }, live?.semantic ? '开' : '关'),
+          h('div', { className: 'dmt-msg ' + (live?.semantic ? 'dmt-ok' : 'dmt-warn') }, live?.semantic ? '开' : '关'),
+        ),
+        live?.semantic ? null : h('div', { className: 'dmt-row', style: { borderLeft: '2px solid var(--dsw-alias-border-warning, #BA7517)', paddingLeft: 12 } },
+          h('div', null,
+            h('div', { className: 'dmt-label' }, '需要先接模型'),
+            h('div', { className: 'dmt-hint' }, '在上面「API Key」填硅基流动的 key 并保存，重启 dsh 后语义检索才会启用。已经有的旧向量不会被读取，也不会被删。'),
+          ),
         ),
         live?.models
           ? h('div', { className: 'dmt-row' },

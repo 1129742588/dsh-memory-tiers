@@ -504,7 +504,7 @@ const vecShardName = (i) => `vectors-part-${String(i).padStart(4, '0')}.json`
 export function createStore(dir, opts = {}) {
   // ★ 向量指纹：记录这批向量是哪个 embedding 模型生成的。
   //
-  //   为什么必须有：hashEmbed、Qwen3-Embedding-0.6B、bge-m3 **都是 1024 维**。
+  //   为什么必须有：Qwen3-Embedding-0.6B、bge-m3 **都是 1024 维**。
   //   换模型时 cosine() 里 `a.length !== b.length` 这个检查不会触发，
   //   旧向量会被当成合法向量参与计算，静默算出垃圾相似度——
   //   不报错、不崩，只是"检索结果越来越怪"，最难查的那种坏。
@@ -583,6 +583,9 @@ export function createStore(dir, opts = {}) {
 
   /** 全量重写分片；条目变少时把多余旧片删掉 */
   function writeVecShards() {
+    // 没有模型时不碰任何向量文件：现有向量可能是真模型生成的，
+    // 用户接回模型后还能直接用，不能被一次空表覆盖掉。
+    if (vectorsDisabled) return 0
     const entries = [...vectors.entries()]
     const shardCount = Math.ceil(entries.length / VEC_SHARD_SIZE)
     for (let i = 0; i < shardCount; i++) {
@@ -602,7 +605,12 @@ export function createStore(dir, opts = {}) {
     return shardCount
   }
 
-  const sharded = readVecShards()
+  // 没有模型（'none'）→ 语义层整体关闭：不读、不写向量文件，检索只走关键词。
+  // 不读是因为查询侧没有 embed，qVec 恒为 null，读了也用不上；
+  // 不写是为了保住现有的向量，等用户接上模型还能续用。
+  const vectorsDisabled = signature === 'none'
+
+  const sharded = vectorsDisabled ? null : readVecShards()
   if (sharded) {
     const meta = readVecMeta()
     // 只在新旧都明确时才判定；老库没有 meta（sig 缺失）按兼容处理，直接沿用
@@ -614,7 +622,7 @@ export function createStore(dir, opts = {}) {
       vectors = sharded
       if (!meta) writeVecMeta(sharded.size)   // 老库补写指纹
     }
-  } else if (existsSync(vecPath)) {
+  } else if (!vectorsDisabled && existsSync(vecPath)) {
     try {
       const raw = JSON.parse(readFileSync(vecPath, 'utf8'))
       for (const [k, v] of Object.entries(raw || {})) {
@@ -2586,6 +2594,7 @@ export function createMemory5(o = {}) {
     const win = parseTime(q, now)
     const kw = keywords(win ? q.replace(win.word, '') : q)
     const qVec = await embedOne(q)
+    const noSem = !qVec      // 没连模型（或本条查询取向量失败）→ 纯关键词/热度打分
 
     const scored = []
     // ★ 只扫目标层（2026-10-31 修）。原来这里是 `for (const it of store.items)`
@@ -2631,8 +2640,12 @@ export function createMemory5(o = {}) {
       //   没有任何一条记忆会含这个词——按老规则整段时间的记忆全被排除，
       //   结果就是"昨天"搜出 0 条，明明那天的东西都在库里。
       //   时间窗本身就是强约束，这里只需要排掉语义上明显无关的。
+      // 没有 embedding 时（qVec 为空）：时间窗查询不能被"零命中"筛掉。
+      // 「昨天发生了什么」去掉时间词只剩"发生什么"，没有任何一条会含这个词，
+      // 语义又用不上，老规则会把整段时间的记忆全排掉——明明东西都在库里。
+      // 时间窗本身就是强约束，这时按热度/重要度排就够了。
       if (win) {
-        if (hit === 0 && sem < 0.2) continue
+        if (!noSem && hit === 0 && sem < 0.2) continue
       } else if (kw.size && hit === 0 && sem < 0.45) {
         continue
       }

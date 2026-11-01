@@ -109,19 +109,9 @@ function resolveAuth(cfg) {
   return null
 }
 
-/** 本地哈希向量：没有 embedding 时的兜底（语义弱，但同话题仍有一定重叠） */
-function hashEmbed(texts, dim = 1024) {
-  return texts.map((t) => {
-    const s = String(t || '')
-    const v = new Array(dim).fill(0)
-    for (let i = 0; i < s.length; i++) {
-      v[s.charCodeAt(i) % dim] += 1
-      if (i < s.length - 1) v[(s.charCodeAt(i) * 31 + s.charCodeAt(i + 1)) % dim] += 0.5
-    }
-    const n = Math.sqrt(v.reduce((a, x) => a + x * x, 0)) || 1
-    return v.map((x) => x / n)
-  })
-}
+/** 本地哈希向量已移除（v0.5.2）：它给的相似度和真实语义无关，
+ *  在 1024 维下和真模型无法区分，只会制造"看起来在检索"的假象。
+ *  没有模型时宁可让语义检索完全关闭，只走关键词。 */
 
 /**
  * 把记忆块注入上下文。
@@ -247,8 +237,9 @@ export function apply(ctx, config = {}) {
       log.warn?.('[memory-tiers] silicon 初始化失败：%s', err?.message ?? err)
     }
   } else {
-    log.warn?.('[memory-tiers] 没有 embedding key（配置 apiKey / 环境变量 SILICONFLOW_API_KEY），'
-      + '降级为本地哈希向量：能跑，但语义检索变弱')
+    log.warn?.('[memory-tiers] 未连接模型（配置 apiKey / 环境变量 SILICONFLOW_API_KEY）：'
+      + '语义检索关闭，只用关键词命中、不做摘要。'
+      + '去「设置 → 记忆 → 模型连接」填 API Key 后重启即可')
   }
 
   const models = silicon
@@ -262,14 +253,15 @@ export function apply(ctx, config = {}) {
         summarizeWithSources: (lines, ch, folks) => silicon.summarizeWithSources(lines, ch, folks),
         rerank: (q, docs) => silicon.rerank(q, docs),
       }
-    : { embed: hashEmbed }
+    // 没有模型就什么都不给：不装假向量。memory5 会自动退到关键词打分
+    : {}
 
   // 向量指纹：写进 vectors.meta.json，换 embed 模型时能被识别出来而不是静默变乱。
-  // 维度相同的模型（hashEmbed / Qwen3-Embedding-0.6B / bge-m3 都是 1024 维）
-  // 靠维度检查发现不了，只能靠这个。
+  // 维度相同的模型（Qwen3-Embedding-0.6B / bge-m3 都是 1024 维）靠维度检查发现不了。
+  // 'none' = 没有模型，此时不加载也不改写向量文件（保留给用户之后接上模型用）。
   const embedSignature = silicon
     ? `api:${silicon.resolveStage('embed').model}`
-    : 'local-hash'
+    : 'none'
 
   const mem = createMemory5({
     dir,

@@ -19,7 +19,7 @@
 | `index.mjs` | dsh 插件入口：注册工具、订阅事件、注入上下文、调度压缩 |
 | `memory5.mjs` | 六层记忆核心：分层、热度、摘要、路由、检索、遗忘 |
 | `compaction.mjs` | 历史压缩：把 dsh 的 surface 压成占位，原文归档进记忆 |
-| `silicon.mjs` | 模型层：embed / 摘要 / 判关系（无 key 时降级为本地哈希向量） |
+| `silicon.mjs` | 模型层：embed / 摘要 / 判关系（无 key 时语义检索关闭，只走关键词） |
 | `cordis.patch.yml` | 告诉 dsh 怎么把插件插进配置树 |
 | `package.json` | 包信息，`dsh.bundle.patch` 是关键字段 |
 | `ARCHITECTURE.md` | 完整架构、实测数据、已知问题清单 |
