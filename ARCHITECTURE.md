@@ -1791,3 +1791,97 @@ if (win) {
 - 好处：不再有"看起来在搜、其实在按字符重叠排序"的假象
 
 **结论：语义检索从"默认降级"变成"必须显式开启"。** 这是有意的。
+
+---
+
+## 24. 模型配置改版 + 融合/摘要跟会话模型（2026-11-01，v0.6.0）
+
+> 用户两条要求：① 嵌入/重排给"硅基流动免费"和"自己指定"两个选择；
+> 融合与摘要**默认跟着当前对话用的模型走**（对话用 flash 就 flash），能改、能关思考。
+> ② 设置页开头每层存量要写清楚多少条、多少字。
+
+### 能不能拿到当前会话模型？能
+
+翻 dsh 的包找到两条现成的路子：
+
+| 服务 | 用法 | 给什么 |
+|---|---|---|
+| `ctx.get('agentDefaultModel')` | `.currentSelection()` | `{provider, model, reasoningEffort}` |
+| `ctx.get('llm')` | `.prepareCall({provider, model, maxTokens}, signal, configure)` | 一次流式调用 |
+
+官方插件 `@deepseek-ai/dsh-session-title-llm` 就是这么打辅助请求的——照抄它的调用姿势。
+好处是**不用我们自己的 key**，dsh 自己有鉴权；对话换模型，这边跟着换。
+
+### 关思考：没有统一开关
+
+`LlmCallControls` 里没有 `enable_thinking` 之类的东西，只有 `reasoningEffort`
+（**适配器私有的不透明字符串**，各家不一样）。正确做法是从 `configure` 的第二个参数
+`modelInfo.reasoning.efforts` 里取**最低档**——`efforts` 是从小到大排的，
+最低档就是这个模型能选的"最少思考"：
+
+```js
+llm.prepareCall({ provider, model, maxTokens }, signal, (controls, modelInfo) => {
+  const efforts = modelInfo?.reasoning?.efforts
+  return { ...controls, reasoningEffort: efforts?.[0]?.id ?? controls.reasoningEffort }
+})
+```
+
+流式回来的 chunk 里 `reasoning-delta` 就是思考内容，**只收 `text-delta`**，其余丢掉。
+
+> ⚠️ 踩不到的坑先记着：`prepareCall` 之后**不能再改** `maxTokens` / `temperature`——
+> 配置被冻住了，改了会抛 `prepared LLM call config changed before adapter dispatch`。
+> 要改就在 `configure` 里改 controls。
+
+### 新的配置形状
+
+```json
+{
+  "preset": "siliconflow",
+  "apiKey": "sk-...",
+  "models": {
+    "chat":    { "source": "session" },
+    "summary": { "source": "session" }
+  },
+  "noThink": { "chat": true, "summary": false }
+}
+```
+
+- `preset: siliconflow` → 嵌入 `BAAI/bge-m3`、重排 `BAAI/bge-reranker-v2-m3`（默认已改成这俩）
+- `preset: custom` → 用 `models.embed/rerank` 里填的 `{base, apiKey, model}`
+- `source: session` → 走会话模型；`api` 或有外部连接参数 → 走 HTTP
+- 任一阶段调用失败/返回空，安静回落 HTTP，不影响主流程
+
+### 设置页
+
+顶部换成一张表：每层 **条数 + 字数 + 这层是什么**，进上下文的层打了「进上下文」标签。
+
+```
+层          条数   字数    存的是什么
+L1 即时      9    735     当前会话原话…     [进上下文]
+L2 巩固      6    480     较重要原话…       [进上下文]
+L3 长期     11   1900     摘要视图…         [进上下文]
+DL1 遗忘中   …                             
+DL2 原文库   …
+DL3 摘要库  44   6000
+向量        82     -      有向量才能语义检索
+```
+
+模型分区：嵌入/重排是二选一卡片；融合/摘要是「跟随当前会话模型 / 自己指定」二选一，
+选了自己指定才展开模型、地址、Key 三个输入框（`showIf` 控制）。
+文案按用户要求写死：融合建议便宜小模型，摘要建议比它大一号的。
+
+### 验证
+
+```
+假 dsh（llm + agentDefaultModel 都是 mock）：
+  session: deepseek-v4-flash
+  embed    HTTP → BAAI/bge-m3
+  rerank   HTTP → BAAI/bge-reranker-v2-m3
+  chat     跟随会话模型 → deepseek-v4-flash
+  summary  跟随会话模型 → deepseek-v4-flash
+  configure 取到最低档 minimal；思考内容被丢弃；只返回 "duplicate"
+
+写 preset=custom + 摘要走 api + noThink.summary=true：
+  applied: ["preset","models.summary.base","models.summary.model","models.summary.source","noThink.summary"]
+回归 41+20+17 全过
+```

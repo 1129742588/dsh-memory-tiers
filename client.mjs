@@ -51,6 +51,16 @@ window.__ModuleLoader__.load({
       '.dmt-stat span{color:var(--dsw-alias-label-tertiary);font-size:11.5px}',
       '.dmt-log{margin-top:8px;padding:8px 10px;border-radius:6px;background:var(--dsw-alias-bg-secondary,rgba(127,127,127,.06));font-family:var(--dsw-font-mono,ui-monospace,monospace);font-size:11px;line-height:16px;white-space:pre-wrap;word-break:break-all;max-height:200px;overflow:auto}',
       '.dmt-mono{font-family:var(--dsw-font-mono,ui-monospace,monospace);font-size:11.5px;word-break:break-all}',
+      '.dmt-table{width:100%;border-collapse:collapse;margin-top:8px;font-size:12.5px}',
+      '.dmt-table th{text-align:left;font-weight:500;color:var(--dsw-alias-label-tertiary);font-size:11.5px;padding:4px 8px 4px 0;border-bottom:1px solid var(--dsw-alias-border-l3,rgba(127,127,127,.2))}',
+      '.dmt-table td{padding:5px 8px 5px 0;border-bottom:1px solid var(--dsw-alias-border-l3,rgba(127,127,127,.12));vertical-align:top}',
+      '.dmt-num{text-align:right;font-family:var(--dsw-font-mono,ui-monospace,monospace);white-space:nowrap}',
+      '.dmt-tag{margin-left:6px;padding:0 5px;border-radius:4px;font-size:10.5px;background:var(--dsw-alias-bg-tertiary,rgba(127,127,127,.12));color:var(--dsw-alias-label-secondary)}',
+      '.dmt-preset{display:flex;gap:8px;flex-wrap:wrap;margin-top:8px}',
+      '.dmt-card{flex:1 1 220px;min-width:200px;padding:10px 12px;border-radius:8px;border:1px solid var(--dsw-alias-border-l3,rgba(127,127,127,.25));cursor:pointer}',
+      '.dmt-card.dmt-on{border-color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-secondary,rgba(127,127,127,.06))}',
+      '.dmt-card b{display:block;font-size:12.5px;font-weight:500}',
+      '.dmt-card span{display:block;margin-top:3px;font-size:11.5px;color:var(--dsw-alias-label-tertiary);line-height:1.5}',
     ].join('\n')
 
     function ensureCss() {
@@ -75,6 +85,16 @@ window.__ModuleLoader__.load({
       return next
     }
 
+    // ── 六层分别是什么，设置页顶部照这个表画 ──
+    const LAYERS = [
+      { key: 'L1', name: 'L1 即时', inCtx: true, desc: '当前会话的对话原话与事件，按时间保存；满了取最老一半往下分流' },
+      { key: 'L2', name: 'L2 巩固', inCtx: true, desc: '较重要的原话，留得住细节；溢出时按是否被摘要引用决定去留' },
+      { key: 'L3', name: 'L3 长期', inCtx: true, desc: '摘要视图（不落盘，从 DL3 排序截出），直接决定注入上下文多少字' },
+      { key: 'DL1', name: 'DL1 遗忘中', inCtx: false, desc: '被判不重要的原文，慢慢遗忘；被再次关注会升回 L2' },
+      { key: 'DL2', name: 'DL2 原文库', inCtx: false, desc: '被摘要引用过的重要原文，保细节，按需检索' },
+      { key: 'DL3', name: 'DL3 摘要库', inCtx: false, desc: 'L3 溢出的摘要，长期沉淀；融合去重在这里做，按需检索' },
+    ]
+
     // ── 字段定义：改这里就能增减配置项（服务端白名单见 settings.mjs 的 WRITABLE） ──
     const FIELDS = [
       {
@@ -95,52 +115,127 @@ window.__ModuleLoader__.load({
       },
 
       {
-        group: '模型（每个阶段可分开指定，留空走默认）',
-        path: ['models', 'summary', 'model'],
-        label: '摘要模型',
+        group: '嵌入与重排',
+        path: ['models', 'embed', 'model'],
+        label: '嵌入模型',
         type: 'text',
         wide: true,
-        hint: '把一批对话压成摘要用哪个。留空 = deepseek-ai/DeepSeek-V4.1-Flash。摘要量最大，想单独走一家便宜的就填这里，并配上下面两项地址和 key。',
+        showIf: (c) => (c?.preset || 'siliconflow') === 'custom',
+        hint: '把记忆变成向量，检索和判重都靠它。硅基流动默认用 BAAI/bge-m3（免费、1024 维）。换模型必须跑一次 reindex，否则旧向量全是废的。',
       },
       {
-        group: '模型（每个阶段可分开指定，留空走默认）',
-        path: ['models', 'summary', 'base'],
-        label: '摘要 API 地址',
+        group: '嵌入与重排',
+        path: ['models', 'embed', 'base'],
+        label: '嵌入 API 地址',
         type: 'text',
         wide: true,
-        hint: '留空 = 用上面「模型连接」里的 API 地址。例：https://api.deepseek.com',
+        showIf: (c) => (c?.preset || 'siliconflow') === 'custom',
+        hint: '留空 = 用上面「模型连接」里的地址。例：https://api.siliconflow.cn/v1',
       },
       {
-        group: '模型（每个阶段可分开指定，留空走默认）',
-        path: ['models', 'summary', 'apiKey'],
-        label: '摘要 API Key',
+        group: '嵌入与重排',
+        path: ['models', 'embed', 'apiKey'],
+        label: '嵌入 API Key',
         type: 'password',
         wide: true,
-        hint: '留空 = 用上面的 API Key。填了就表示摘要单独走另一家。',
+        showIf: (c) => (c?.preset || 'siliconflow') === 'custom',
+        hint: '留空 = 用上面的 API Key。',
       },
       {
-        group: '模型（每个阶段可分开指定，留空走默认）',
-        path: ['models', 'chat', 'model'],
-        label: '轻任务模型',
-        type: 'text',
-        wide: true,
-        hint: '判重、判矛盾、分类这些高频小任务，选快而便宜的。留空 = inclusionAI/Ling-mini-2.0。',
-      },
-      {
-        group: '模型（每个阶段可分开指定，留空走默认）',
-        path: ['models', 'embed', 'model'],
-        label: '向量模型',
-        type: 'text',
-        wide: true,
-        hint: '检索和入库判重都靠它。留空 = Qwen/Qwen3-Embedding-0.6B。换模型后向量维度不同，旧库要重建。',
-      },
-      {
-        group: '模型（每个阶段可分开指定，留空走默认）',
+        group: '嵌入与重排',
         path: ['models', 'rerank', 'model'],
         label: '重排模型',
         type: 'text',
         wide: true,
-        hint: '检索结果精排。留空 = Qwen/Qwen3-Reranker-0.6B。',
+        showIf: (c) => (c?.preset || 'siliconflow') === 'custom',
+        hint: '检索结果的精排（判断"这条到底相不相关"）。硅基流动默认 BAAI/bge-reranker-v2-m3，和 bge-m3 同门。',
+      },
+      {
+        group: '嵌入与重排',
+        path: ['models', 'rerank', 'base'],
+        label: '重排 API 地址',
+        type: 'text',
+        wide: true,
+        showIf: (c) => (c?.preset || 'siliconflow') === 'custom',
+        hint: '留空 = 用上面「模型连接」里的地址。',
+      },
+      {
+        group: '嵌入与重排',
+        path: ['models', 'rerank', 'apiKey'],
+        label: '重排 API Key',
+        type: 'password',
+        wide: true,
+        showIf: (c) => (c?.preset || 'siliconflow') === 'custom',
+        hint: '留空 = 用上面的 API Key。',
+      },
+
+      {
+        group: '融合与摘要',
+        path: ['models', 'chat', 'model'],
+        label: '融合模型（自己指定时）',
+        type: 'text',
+        wide: true,
+        showIf: (c) => c?.models?.chat?.source === 'api',
+        hint: '判重 / 判矛盾 / 判进展 / 分类。这活只要一个词，用便宜快的小模型就够，别上大模型。',
+      },
+      {
+        group: '融合与摘要',
+        path: ['models', 'chat', 'base'],
+        label: '融合 API 地址',
+        type: 'text',
+        wide: true,
+        showIf: (c) => c?.models?.chat?.source === 'api',
+        hint: '留空 = 用上面「模型连接」里的地址。',
+      },
+      {
+        group: '融合与摘要',
+        path: ['models', 'chat', 'apiKey'],
+        label: '融合 API Key',
+        type: 'password',
+        wide: true,
+        showIf: (c) => c?.models?.chat?.source === 'api',
+        hint: '留空 = 用上面的 API Key。',
+      },
+      {
+        group: '融合与摘要',
+        path: ['noThink', 'chat'],
+        label: '融合时关思考',
+        type: 'boolean',
+        hint: '推荐开。判关系只要一个词，开思考既慢又费 token，还可能把词藏进推理里。',
+      },
+      {
+        group: '融合与摘要',
+        path: ['models', 'summary', 'model'],
+        label: '摘要模型（自己指定时）',
+        type: 'text',
+        wide: true,
+        showIf: (c) => c?.models?.summary?.source === 'api',
+        hint: '把一批对话压成摘要。要它读得多、写得准，建议用比融合模型大一号或多一号的。',
+      },
+      {
+        group: '融合与摘要',
+        path: ['models', 'summary', 'base'],
+        label: '摘要 API 地址',
+        type: 'text',
+        wide: true,
+        showIf: (c) => c?.models?.summary?.source === 'api',
+        hint: '留空 = 用上面「模型连接」里的地址。',
+      },
+      {
+        group: '融合与摘要',
+        path: ['models', 'summary', 'apiKey'],
+        label: '摘要 API Key',
+        type: 'password',
+        wide: true,
+        showIf: (c) => c?.models?.summary?.source === 'api',
+        hint: '留空 = 用上面的 API Key。',
+      },
+      {
+        group: '融合与摘要',
+        path: ['noThink', 'summary'],
+        label: '摘要时关思考',
+        type: 'boolean',
+        hint: '默认不关。摘要要想清楚再压，压错了信息就真丢了。',
       },
 
       {
@@ -322,21 +417,104 @@ window.__ModuleLoader__.load({
       if (!cfg) return h('div', { className: 'dmt' }, h('div', { className: 'dmt-hint' }, '加载中…'))
 
       const c = live?.counts || {}
+      const ch = live?.chars || {}
+
+      // ── 嵌入/重排：硅基流动免费模型 还是 自己指定 ──
+      const presetNow = cfg?.preset || 'siliconflow'
+      const presetCards = h('div', { className: 'dmt-preset' },
+        h('div', {
+          className: 'dmt-card' + (presetNow === 'siliconflow' ? ' dmt-on' : ''),
+          onClick: () => setField(['preset'], 'siliconflow'),
+        },
+          h('b', null, '硅基流动 · 免费模型'),
+          h('span', null, '嵌入 BAAI/bge-m3 + 重排 BAAI/bge-reranker-v2-m3。中文够用，日常首选，只要一个 key。'),
+        ),
+        h('div', {
+          className: 'dmt-card' + (presetNow === 'custom' ? ' dmt-on' : ''),
+          onClick: () => setField(['preset'], 'custom'),
+        },
+          h('b', null, '自己指定来源'),
+          h('span', null, '填下面的地址 / Key / 模型名，可以换更高级的或自建服务。'),
+        ),
+      )
+
+      // ── 融合/摘要：跟当前会话模型走，还是自己指定 ──
+      const sess = live?.session
+      const sourceRow = (stage, title, tip) => {
+        const cur = cfg?.models?.[stage]?.source || 'session'
+        return h('div', { className: 'dmt-row', key: stage },
+          h('div', null,
+            h('div', { className: 'dmt-label' }, title),
+            h('div', { className: 'dmt-hint' }, tip),
+          ),
+          h('div', { className: 'dmt-preset', style: { marginTop: 0, gap: 6 } },
+            h('div', {
+              className: 'dmt-card' + (cur === 'session' ? ' dmt-on' : ''),
+              style: { flex: '0 0 auto', minWidth: 132 },
+              onClick: () => setField(['models', stage, 'source'], 'session'),
+            },
+              h('b', null, '跟随当前会话模型'),
+              h('span', null, sess?.available ? `现在：${sess.model}` : '（通道不可用）'),
+            ),
+            h('div', {
+              className: 'dmt-card' + (cur === 'api' ? ' dmt-on' : ''),
+              style: { flex: '0 0 auto', minWidth: 100 },
+              onClick: () => setField(['models', stage, 'source'], 'api'),
+            },
+              h('b', null, '自己指定'),
+              h('span', null, '填下面的模型 / 地址 / Key'),
+            ),
+          ),
+        )
+      }
+      const sessionBlock = h('div', null,
+        h('div', { className: 'dmt-hint', style: { marginBottom: 6 } },
+          sess?.available
+            ? `当前会话模型：${sess.model}（${sess.provider}）。选「跟随」就不用额外配 key，对话换模型它也跟着换。`
+            : `没检测到会话模型通道（${sess?.reason || '未知'}）：这两个阶段只能自己指定外部来源。`),
+        sourceRow('chat', '融合模型（判重 / 判矛盾 / 分类）', '只输出一个词，建议便宜快的小模型'),
+        sourceRow('summary', '摘要模型', '要把几十条压成一段，建议用比融合模型大一号的'),
+      )
 
       return h('div', { className: 'dmt' },
         h('h3', { className: 'dmt-title' }, '记忆'),
         h('p', { className: 'dmt-intro' },
           '六层记忆 + 零 LLM 历史压缩。同一会话里记忆负责「记得住」，压缩负责「上下文不涨」。改完需要重启 dsh 生效。'),
 
-        // ── 运行状态（只读） ──
-        h('div', { className: 'dmt-group' }, '运行状态'),
-        h('div', { className: 'dmt-stats' },
-          h('div', { className: 'dmt-stat' }, h('b', null, String(c.L1 ?? '-')), h('span', null, 'L1 即时')),
-          h('div', { className: 'dmt-stat' }, h('b', null, String(c.L2 ?? '-')), h('span', null, 'L2 巩固')),
-          h('div', { className: 'dmt-stat' }, h('b', null, String(c.L3 ?? '-')), h('span', null, 'L3 长期')),
-          h('div', { className: 'dmt-stat' }, h('b', null, String(c.DL3 ?? '-')), h('span', null, 'DL3 摘要库')),
-          h('div', { className: 'dmt-stat' }, h('b', null, String(live?.vectors ?? '-')), h('span', null, '向量')),
+        // ── 每层存量（只读）：条数 + 字数 + 每层干什么 ──
+        h('div', { className: 'dmt-group' }, '每层现在存了多少'),
+        h('table', { className: 'dmt-table' },
+          h('thead', null,
+            h('tr', null,
+              h('th', null, '层'),
+              h('th', null, '条数'),
+              h('th', null, '字数'),
+              h('th', null, '存的是什么 / 怎么用'),
+            ),
+          ),
+          h('tbody', null,
+            LAYERS.map((l) => {
+              const n = c[l.key] ?? 0
+              const s = ch[l.key] ?? 0
+              return h('tr', { key: l.key },
+                h('td', null, h('b', null, l.name), l.inCtx ? h('span', { className: 'dmt-tag' }, '进上下文') : null),
+                h('td', { className: 'dmt-num' }, String(n)),
+                h('td', { className: 'dmt-num' }, s ? s.toLocaleString() : '0'),
+                h('td', { className: 'dmt-hint' }, l.desc),
+              )
+            }),
+            h('tr', { key: 'vec' },
+              h('td', null, h('b', null, '向量')),
+              h('td', { className: 'dmt-num' }, String(live?.vectors ?? 0)),
+              h('td', { className: 'dmt-num' }, '-'),
+              h('td', { className: 'dmt-hint' }, '有向量的条目才能语义检索；0 = 没接模型或还没重建'),
+            ),
+          ),
         ),
+        h('div', { className: 'dmt-hint', style: { marginTop: 4 } },
+          `合计 ${live?.total ?? 0} 条。` + (live?.semantic
+            ? '语义检索已开启。'
+            : '没接模型：检索只走关键词。')),
         h('div', { className: 'dmt-row' },
           h('div', null,
             h('div', { className: 'dmt-label' }, '数据目录'),
@@ -369,7 +547,9 @@ window.__ModuleLoader__.load({
                 className: 'dmt-mono',
                 style: { whiteSpace: 'pre-line', textAlign: 'right' },
               }, Object.entries(live.models)
-                .map(([k, v]) => k + ': ' + (v.model || '?') + ' @ ' + String(v.base || '').replace(/^https?:\/\//, ''))
+                .map(([k, v]) => k + ': ' + (v.source === 'session'
+                  ? '跟随会话模型 ' + (v.sessionModel || '?')
+                  : (v.model || '?') + ' @ ' + String(v.base || '').replace(/^https?:\/\//, '')))
                 .join('\n')),
             )
           : null,
@@ -378,8 +558,10 @@ window.__ModuleLoader__.load({
         ...GROUPS.map((g) =>
           h('div', { key: g },
             h('div', { className: 'dmt-group' }, g),
+            g === '嵌入与重排' ? presetCards : null,
+            g === '融合与摘要' ? sessionBlock : null,
             h('div', { className: 'dmt-rows' },
-              FIELDS.filter((f) => f.group === g).map((f) =>
+              FIELDS.filter((f) => f.group === g && (!f.showIf || f.showIf(cfg, live))).map((f) =>
                 h(Field, {
                   key: f.path.join('.'),
                   field: f,

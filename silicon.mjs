@@ -43,8 +43,9 @@ import { readFileSync } from 'node:fs'
 const DEFAULTS = {
   apiKey: '',
   base: DEFAULT_BASE,
-  embedModel: 'Qwen/Qwen3-Embedding-0.6B',
-  rerankModel: 'Qwen/Qwen3-Reranker-0.6B',
+  // 默认就是硅基流动上那两个免费的：中文够用，换 embed 记得跑一次 reindex
+  embedModel: 'BAAI/bge-m3',
+  rerankModel: 'BAAI/bge-reranker-v2-m3',
   chatModel: 'inclusionAI/Ling-mini-2.0',            // 高频轻任务
   summaryModel: 'deepseek-ai/DeepSeek-V4.1-Flash',    // 低频重任务
   timeoutMs: 20000,
@@ -334,19 +335,31 @@ export function createSilicon(options = {}) {
     const base = String(over.base || cfg.base || '').replace(/\/+$/, '')
     const apiKey = over.apiKey || cfg.apiKey || ''
     const model = over.model || cfg[name + 'Model'] || ''
+    // source: 'session' = 走 dsh 当前会话模型（不用我们的 key）；'api' = 走 HTTP
+    const source = sessionStages.has(name) ? 'session' : 'api'
     return {
       base,
       apiKey,
       model,
+      source,
+      sessionModel: source === 'session' ? (session?.model || null) : null,
       chat: base + '/chat/completions',
       embed: base + '/embeddings',
       rerank: base + '/rerank',
     }
   }
 
-  // 只要任意一个阶段拿到了 key 就能跑；全部为空才认为没配（由调用方降级到本地哈希向量）
+  // 只要任意一个阶段拿到了 key 就能跑；全部为空才认为没配（由调用方降级到关键词检索）
   const anyKey = cfg.apiKey || STAGES.some((s) => cfg.models?.[s]?.apiKey)
-  if (!anyKey) throw new Error('[silicon] 缺少 apiKey（顶层或某个阶段的 models[s].apiKey）')
+
+  // 会话模型通道：这些阶段的请求改走 dsh 当前会话模型，不用我们的 key。
+  //   传法：{ session: { call, stages: ['chat','summary'] } }
+  //   没传、或调用失败，都安静回落 HTTP。
+  const session = options.session && typeof options.session.call === 'function' ? options.session : null
+  const sessionStages = new Set(Array.isArray(session?.stages) ? session.stages : [])
+  const log = typeof options.onFallback === 'function' ? options.onFallback : null
+
+  if (!anyKey && !session) throw new Error('[silicon] 缺少 apiKey（顶层或某个阶段的 models[s].apiKey），且没有会话模型通道')
 
   const chatUrl = `${cfg.base.replace(/\/+$/, '')}/chat/completions`
   const embedUrl = `${cfg.base.replace(/\/+$/, '')}/embeddings`
@@ -434,11 +447,38 @@ export function createSilicon(options = {}) {
       stage: stageName = 'chat',
       model,
       timeout = cfg.timeoutMs,
-      thinking = false,
+      thinking,
     } = opts
 
     const st = stage(stageName)
     const useModel = model || st.model
+
+    // 关思考：调用方没明说时按 cfg.noThink[stage]，默认 chat 关（判关系只要一个词）、
+    // summary 默认不关（要它想清楚再压）。
+    const noThink = thinking === undefined ? cfg.noThink?.[stageName] !== false : thinking === false
+
+    // ★ 该阶段配置成"走会话模型"时，改用 dsh 自己的模型通道（不用我们的 key）。
+    //   失败（没拿到服务 / 流式报错 / 空输出）一律安静回落 HTTP，不影响主流程。
+    if (session?.call && sessionStages.has(stageName)) {
+      try {
+        const out = await session.call({
+          system,
+          user,
+          maxTokens,
+          temperature,
+          disableThinking: noThink,
+          timeoutMs: timeout,
+        })
+        const text = (typeof out === 'string' ? out : out?.text || '').trim()
+        if (text) {
+          note(stageName, 0, `session:${out?.model || useModel}`)
+          return text
+        }
+        log?.('会话模型返回空，回落 HTTP：%s', stageName)
+      } catch (err) {
+        log?.('会话模型调用失败，回落 HTTP（%s）：%s', stageName, err?.message ?? err)
+      }
+    }
 
     const body = {
       model: useModel,
@@ -446,7 +486,7 @@ export function createSilicon(options = {}) {
       max_tokens: maxTokens,
       temperature,
     }
-    if (thinking === false) body.enable_thinking = false
+    if (noThink) body.enable_thinking = false
 
     // ★ 用该阶段自己的 url / key：摘要可以挂到另一家 provider 上
     const d = await post(st.chat, st.apiKey, body, timeout, cfg.retries, cfg.maxConcurrent, cfg.rateLimitRetries, cfg.rateLimitBaseMs, guard)
@@ -924,7 +964,14 @@ export function createSilicon(options = {}) {
     /** 给设置页/诊断用：某阶段最终解析成什么 */
     resolveStage: (name) => {
       const st = stage(name)
-      return { base: st.base, model: st.model, hasKey: !!st.apiKey }
+      return {
+        base: st.base,
+        model: st.model,
+        hasKey: !!st.apiKey,
+        // 'session' = 走 dsh 当前会话模型（不用我们的 key）；'api' = 走 HTTP
+        source: st.source,
+        sessionModel: st.sessionModel,
+      }
     },
     stages: () => STAGES,
   }

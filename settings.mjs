@@ -24,7 +24,12 @@ const WRITABLE = {
   budgetTokens: 'number',
   flushEveryMs: 'number',
   sweepEveryMs: 'number',
+  // 'siliconflow' = 嵌入/重排用那两个免费模型；'custom' = 用 models 里自己填的
+  preset: 'string',
 }
+
+/** 关思考：chat（融合判关系）默认 true，summary 默认 false */
+const NOTHINK_WRITABLE = { chat: 'boolean', summary: 'boolean' }
 
 /** 三层容量在 memoryCfg 里，单独处理 */
 const MEMORY_CFG_WRITABLE = {
@@ -36,7 +41,8 @@ const MEMORY_CFG_WRITABLE = {
 
 /** 每个模型阶段可单独覆盖的连接参数；留空字符串 = 清除覆盖、回落到顶层 */
 const STAGES = ['embed', 'rerank', 'chat', 'summary']
-const STAGE_FIELDS = { base: 'string', apiKey: 'string', model: 'string' }
+// source: 'session' 跟当前会话模型走；'api' 或留空则走下面的连接参数
+const STAGE_FIELDS = { base: 'string', apiKey: 'string', model: 'string', source: 'string' }
 
 function json(res, code, obj) {
   const body = JSON.stringify(obj)
@@ -90,7 +96,7 @@ function coerce(kind, value) {
  * @returns {() => void} disposer；webServer 不可用时返回 null
  */
 export function installSettingsApi(ctx, opts) {
-  const { dir, getCfg, log, mem, getModels } = opts
+  const { dir, getCfg, log, mem, getModels, getSession } = opts
   const webServer = ctx.webServer
   if (!webServer?.register) return null
 
@@ -141,10 +147,19 @@ export function installSettingsApi(ctx, opts) {
         live: {
           dir,
           counts: stats?.count ?? null,
+          chars: stats?.chars ?? null,        // 每层字数（设置页要写清楚"存了多少字"）
           vectors: stats?.vectors ?? null,
+          total: stats?.total ?? null,
+          byChannel: stats?.byChannel ?? null,
           semantic: !!(live.apiKey || process.env.SILICONFLOW_API_KEY ||
             Object.values(live.models || {}).some((m) => m?.apiKey)),
           autoCompact: live.autoCompact !== false,
+          preset: live.preset || 'siliconflow',
+          noThink: { chat: true, summary: false, ...(file.noThink || {}) },
+          // 会话模型通道：能不能用、当前是哪个模型
+          session: (() => {
+            try { return getSession?.() ?? null } catch { return null }
+          })(),
           // 各阶段最终解析成什么（覆盖已合并），设置页拿来显示"实际生效"
           models: (() => {
             try { return getModels?.() ?? null } catch { return null }
@@ -206,10 +221,28 @@ export function installSettingsApi(ctx, opts) {
           else dst[k] = v
           applied.push(`models.${st}.${k}`)
         }
+        // source 只接受 session / api，别的值（含乱写）一律当"没配"
+        if (typeof dst.source === 'string' && dst.source !== 'session' && dst.source !== 'api') {
+          delete dst.source
+          ignored.push(`models.${st}.source`)
+        }
         if (Object.keys(dst).length) mm[st] = dst
         else delete mm[st]
       }
       next.models = mm
+    }
+
+    // ── 关思考 ──
+    if (incoming.noThink && typeof incoming.noThink === 'object') {
+      const nt = { ...(cur.noThink || {}) }
+      for (const [k, kind] of Object.entries(NOTHINK_WRITABLE)) {
+        if (!(k in incoming.noThink)) continue
+        const v = coerce(kind, incoming.noThink[k])
+        if (v === undefined) { ignored.push('noThink.' + k); continue }
+        nt[k] = v
+        applied.push('noThink.' + k)
+      }
+      next.noThink = nt
     }
 
     try {

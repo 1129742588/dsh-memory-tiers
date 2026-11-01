@@ -21,14 +21,21 @@ import { createMemory5, LAYER, DEFAULTS as MEM_DEFAULTS } from './memory5.mjs'
 import { createSilicon, keyFromAstrbot } from './silicon.mjs'
 import { compactSurface } from './compaction.mjs'
 import { installSettingsApi } from './settings.mjs'
+import { createSessionCaller } from './dshllm.mjs'
 
 export const name = 'memory-tiers'
 export const inject = ['tools']
 
 const PLUGIN_DEFAULTS = {
   dir: '',
+  // 'siliconflow' = 嵌入/重排用硅基流动那两个免费的（bge-m3 / bge-reranker-v2-m3）
+  // 'custom'      = 用 models 里自己填的来源
+  preset: 'siliconflow',
   apiKey: '',
   apiBase: 'https://api.siliconflow.cn/v1',
+  // 每个阶段：{ source: 'session' } 跟当前会话模型，或 { base, apiKey, model } 走外部
+  models: { chat: { source: 'session' }, summary: { source: 'session' } },
+  noThink: { chat: true, summary: false },
   bootMaxChars: 0,               // 0 = 不限制，注入量由 L1/L2/L3 各自容量决定
   budgetTokens: 0,
   autoCapture: true,          // 自动订阅 session/event 写入 L1
@@ -189,6 +196,8 @@ export function apply(ctx, config = {}) {
     const p = join(dir, 'config.json')
     if (!existsSync(p)) {
       writeFileSync(p, JSON.stringify({
+        // preset: 'siliconflow' = 嵌入/重排用硅基流动那两个免费模型；'custom' = 自己填下面的 models
+        preset: 'siliconflow',
         apiKey: '',
         apiBase: 'https://api.siliconflow.cn/v1',
         bootMaxChars: 0,               // 0 = 不限制，注入量由 L1/L2/L3 各自容量决定
@@ -202,10 +211,16 @@ export function apply(ctx, config = {}) {
         compactKeepTurns: 1,
         compactArchiveChars: 1200,
         memoryCfg: { longMaxChars: 4000 },
-        // 每个模型阶段可单独覆盖 { base, apiKey, model }；留空继承顶层 apiKey/apiBase。
-        // 例：想让它摘要走 DeepSeek 官方而不走硅基流动
-        //   models: { summary: { base: 'https://api.deepseek.com', apiKey: 'sk-...', model: 'deepseek-chat' } }
-        models: {},
+        // 每个模型阶段可单独覆盖。两种来源：
+        //   source: 'session' —— 走 dsh 当前会话模型（对话用 flash 就 flash，不用额外 key）
+        //   { base, apiKey, model } —— 走外部 provider
+        // 默认：嵌入/重排走硅基流动免费模型，融合/摘要跟当前会话模型。
+        models: {
+          chat: { source: 'session' },
+          summary: { source: 'session' },
+        },
+        // 关思考：融合只要一个词，关掉更快更省；摘要要它想清楚，默认不关
+        noThink: { chat: true, summary: false },
         _说明: [
           'apiKey 填硅基流动的 key（也可以设环境变量 SILICONFLOW_API_KEY）；',
           '留空则用本地哈希向量，语义检索会变弱。改完重启 dsh 生效。',
@@ -216,22 +231,54 @@ export function apply(ctx, config = {}) {
           'refreshMinMs = 记忆块变化后的最小刷新间隔（毫秒），默认 1800000（30 分钟）。',
           'autoCompact = 每轮结束时把 dsh 自带历史压成一条占位（零 LLM），被压掉的内容先归档进记忆。',
           'compactKeepTurns = 压完保留最近几轮原文。默认 1：上下文恒定 = 系统提示 + 记忆块 + 最近 1 轮。',
+          'preset = siliconflow 时，嵌入用 BAAI/bge-m3、重排用 BAAI/bge-reranker-v2-m3（都免费）；custom 则用 models 里填的。',
+          'models[stage].source = session 表示这个阶段跟着当前对话用的模型走（不用额外 key）；api 则走下面填的地址/key。',
+          'noThink = 是否关思考。chat（融合判关系）默认关，summary 默认不关。',
         ],
       }, null, 2), 'utf8')
     }
   } catch { /* 写不了不影响主流程 */ }
 
+  // ── 会话模型通道：融合 / 摘要可以直接跟着当前对话用的模型走 ──
+  //   拿不到 llm 服务也不影响，那些阶段会回落到自己的 HTTP 配置
+  const session = createSessionCaller(() => ctx, { log })
+  const sessionInfo = session.info()
+  if (sessionInfo.available) {
+    log.info?.('[memory-tiers] 会话模型可用：%s / %s（融合、摘要默认跟着它走）',
+      sessionInfo.provider, sessionInfo.model)
+  } else {
+    log.warn?.('[memory-tiers] 会话模型不可用（%s）：融合 / 摘要按 models 里的外部配置走',
+      sessionInfo.reason)
+  }
+
+  // 哪些阶段走会话模型：默认 chat（融合判关系）+ summary；用户显式改 'api' 才走 HTTP
+  const sessionStages = ['chat', 'summary']
+    .filter((s) => {
+      const m = cfg.models?.[s]
+      // 没配就默认跟会话模型；配了 source:'api' 或有外部 base/apiKey 就走 HTTP
+      if (!m) return true
+      if (m.source === 'api') return false
+      if (m.source === 'session') return true
+      return !(m.base || m.apiKey || m.model)
+    })
+
   // ── 模型层：有 key 接 silicon，没 key 降级本地向量 ──
   const auth = resolveAuth(cfg)
   let silicon = null
-  if (auth) {
+  if (auth || (sessionInfo.available && sessionStages.length)) {
     try {
       silicon = createSilicon({
-        apiKey: auth.apiKey,
-        base: auth.base,
+        apiKey: auth?.apiKey || '',
+        base: auth?.base || cfg.apiBase,
         budgetTokens: cfg.budgetTokens,
         // 每个阶段可单独指定 { base, apiKey, model }；留空继承上面的 apiKey/base
         models: cfg.models || {},
+        noThink: cfg.noThink || {},
+        // 没有 key 时，embed/rerank 照样起不来，但 chat/summary 还能走会话模型
+        session: sessionInfo.available && sessionStages.length
+          ? { call: session.call, stages: sessionStages, model: sessionInfo.model }
+          : null,
+        onFallback: (fmt, ...args) => log.warn?.('[memory-tiers] ' + fmt, ...args),
       })
     } catch (err) {
       log.warn?.('[memory-tiers] silicon 初始化失败：%s', err?.message ?? err)
@@ -574,6 +621,7 @@ export function apply(ctx, config = {}) {
         for (const st of silicon.stages()) out[st] = silicon.resolveStage(st)
         return out
       },
+      getSession: () => session.info(),
     })
     if (typeof off === 'function') {
       try { c.effect(() => off, 'memory-tiers: settings api') } catch { /* 老版本没有 effect 也不影响接口可用 */ }
