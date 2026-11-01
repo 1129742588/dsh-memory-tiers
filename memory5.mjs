@@ -501,13 +501,23 @@ const VEC_SHARD_SIZE = 5000
 const VEC_SHARD_RE = /^vectors-part-(\d{4})\.json$/
 const vecShardName = (i) => `vectors-part-${String(i).padStart(4, '0')}.json`
 
-export function createStore(dir) {
+export function createStore(dir, opts = {}) {
+  // ★ 向量指纹：记录这批向量是哪个 embedding 模型生成的。
+  //
+  //   为什么必须有：hashEmbed、Qwen3-Embedding-0.6B、bge-m3 **都是 1024 维**。
+  //   换模型时 cosine() 里 `a.length !== b.length` 这个检查不会触发，
+  //   旧向量会被当成合法向量参与计算，静默算出垃圾相似度——
+  //   不报错、不崩，只是"检索结果越来越怪"，最难查的那种坏。
+  //
+  //   指纹不符 → 隔离旧向量 + 从零重建，宁可暂时没有语义检索也不给错的结果。
+  const signature = typeof opts.signature === 'string' ? opts.signature : null
   mkdirSync(dir, { recursive: true })
   mkdirSync(join(dir, 'archive'), { recursive: true })
   mkdirSync(join(dir, 'graveyard'), { recursive: true })
 
   const storePath = join(dir, 'store.json')
   const vecPath = join(dir, 'vectors.json')   // 旧版单文件：只读兼容 + 迁移用
+  const metaPath = join(dir, 'vectors.meta.json')
 
   let state = { version: 5, seq: 0, items: [] }
   let vectors = new Map()
@@ -517,6 +527,39 @@ export function createStore(dir) {
       const raw = JSON.parse(readFileSync(storePath, 'utf8'))
       if (raw && Array.isArray(raw.items)) state = raw
     } catch { /* 坏了就当空库，不让它挡住启动 */ }
+  }
+
+  function readVecMeta() {
+    try { return JSON.parse(readFileSync(metaPath, 'utf8')) } catch { return null }
+  }
+
+  /** 记录这批向量的来源模型；dim 顺带存一份，方便人工核对 */
+  function writeVecMeta(count) {
+    const first = vectors.values().next().value
+    try {
+      writeFileSync(metaPath, JSON.stringify({
+        sig: signature,
+        dim: first ? first.length : 0,
+        count,
+        at: new Date().toISOString(),
+      }, null, 1), 'utf8')
+    } catch { /* 写不了元数据不影响主流程 */ }
+  }
+
+  /** 指纹不符时把旧向量整体挪走（不删，留给用户回退/核对） */
+  function quarantineVectors(reason) {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+    const bak = join(dir, `vectors.stale-${stamp}`)
+    let moved = 0
+    try {
+      mkdirSync(bak, { recursive: true })
+      for (const f of readdirSync(dir)) {
+        if (!VEC_SHARD_RE.test(f) && f !== 'vectors.meta.json') continue
+        try { renameSync(join(dir, f), join(bak, f)); moved++ } catch { /* 单个失败不阻塞 */ }
+      }
+    } catch { /* 建不了备份目录就原地不动，下面也不加载 */ }
+    console.warn?.('[memory5] 向量指纹不符（%s），旧向量已隔离到 %s（%d 个文件）', reason, bak, moved)
+    return bak
   }
 
   /** 读全部分片；没有任何分片返回 null（交给旧文件兼容逻辑） */
@@ -555,12 +598,22 @@ export function createStore(dir) {
         if (m && Number(m[1]) >= shardCount) unlinkSync(join(dir, f))
       }
     } catch { /* 清不掉不影响正确性，下次再清 */ }
+    writeVecMeta(entries.length)
     return shardCount
   }
 
   const sharded = readVecShards()
   if (sharded) {
-    vectors = sharded
+    const meta = readVecMeta()
+    // 只在新旧都明确时才判定；老库没有 meta（sig 缺失）按兼容处理，直接沿用
+    const stale = signature && meta && typeof meta.sig === 'string' && meta.sig !== signature
+    if (stale) {
+      quarantineVectors(`${meta.sig} → ${signature}`)
+      vectors = new Map()
+    } else {
+      vectors = sharded
+      if (!meta) writeVecMeta(sharded.size)   // 老库补写指纹
+    }
   } else if (existsSync(vecPath)) {
     try {
       const raw = JSON.parse(readFileSync(vecPath, 'utf8'))
@@ -690,7 +743,7 @@ export function createMemory5(o = {}) {
   const cfg = { ...DEFAULTS, ...(o.cfg || {}) }
   const dir = o.dir || '.memory5'
   const tick = o.now || (() => Date.now())
-  const store = createStore(dir)
+  const store = createStore(dir, { signature: o.embedSignature })
 
   // ============================================================
   // 模型调用统计

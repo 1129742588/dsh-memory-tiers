@@ -1611,3 +1611,69 @@ summary  {"base":"https://api.deepseek.com","model":"deepseek-chat","hasKey":tru
 
 换 `embed` 模型会导致**向量维度变化**，旧库的向量全部作废。真要换得清空 `vectors-part-*.json` 并重建，
 否则检索结果会乱。设置页的提示里写了这条。
+
+---
+
+## 22. 向量指纹与重建（2026-11-01，v0.5.1）
+
+> 起因：想换 `BAAI/bge-m3` 做 embedding。查了一下发现两件事——
+> ① 现在根本没连模型（`apiKey` 为空，82 条向量是本地 `hashEmbed` 出来的）；
+> ② hashEmbed / Qwen3-Embedding-0.6B / bge-m3 **全是 1024 维**，
+>    `cosine()` 里的 `a.length !== b.length` 永远不触发。
+
+### 静默污染问题
+
+```js
+export function cosine(a, b) {
+  if (!a || !b || a.length !== b.length) return 0   // ← 同维度模型换不掉
+  ...
+}
+```
+
+换模型 = 换坐标系。旧坐标在新坐标系里没有意义，但维数一样，代码照常算出数字——
+不报错、不崩，只表现为「检索结果越来越怪」。这是最难查的一类坏。
+
+### 解决：记录向量是谁生成的
+
+新增 `vectors.meta.json`：
+
+```json
+{ "sig": "api:BAAI/bge-m3", "dim": 1024, "count": 82, "at": "2026-11-01T03:51:25.260Z" }
+```
+
+- `sig` 由插件传入：`api:<embed 阶段解析后的模型名>`，无模型时是 `local-hash`
+- 加载分片时比对 `sig`，**不一致就把旧向量整体搬到 `vectors.stale-<ts>/`**，然后向量表归零
+- 老库没有 meta 时**按兼容处理**（直接沿用 + 补写指纹），不能因为加了个字段就让用户崩
+- 隔离而不是删除：出问题还能人工核对或整体搬回
+
+验证：
+
+```
+① 同指纹加载: 1 条                       ← 正常加载
+② 换模型后: 0 条 | 剩余分片 0 | 隔离目录 vectors.stale-...
+   保存后 meta: {"sig":"api:BAAI/bge-m3","dim":0,"count":0}
+③ 新指纹再打开: 0 条                     ← 不会反复搬家
+④ 老库无指纹: 1 条 | 补写 meta           ← 向后兼容
+```
+
+### 重建工具 `reindex.mjs`
+
+```bash
+node reindex.mjs --dry     # 体检：几条、什么模型、指纹是啥
+node reindex.mjs           # 真重嵌（默认先备份旧向量）
+node reindex.mjs --force   # 不备份
+```
+
+要点：
+
+- **截断口径必须和运行时一致**（`slice(0, 512)`）。重建用 8192、线上用 512，
+  两批向量就不是同一个分布了，等于白做。
+- 分片格式一致：base64 的 `Float32Array`，每片 5000 条
+- 写完 meta，`sig` 与运行时一致 → 重启后不会再触发隔离
+- 没有 `apiKey` 直接退出并说明原因（哈希向量重建没意义）
+
+### 换 embedding 后的旧条目
+
+重建前隔离掉的旧向量里，条目文本都还在 `store.json`，所以：
+**跑一次 `reindex.mjs` 就能全部补回来**，条目本身不会丢。
+不跑的话，旧条目只能被关键词命中，`memory_search` 的语义部分对它们失效。

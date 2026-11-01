@@ -264,9 +264,17 @@ export function apply(ctx, config = {}) {
       }
     : { embed: hashEmbed }
 
+  // 向量指纹：写进 vectors.meta.json，换 embed 模型时能被识别出来而不是静默变乱。
+  // 维度相同的模型（hashEmbed / Qwen3-Embedding-0.6B / bge-m3 都是 1024 维）
+  // 靠维度检查发现不了，只能靠这个。
+  const embedSignature = silicon
+    ? `api:${silicon.resolveStage('embed').model}`
+    : 'local-hash'
+
   const mem = createMemory5({
     dir,
     ...models,
+    embedSignature,
     // memoryCfg 允许 config.json 覆盖 v5 的底层参数（如 longMaxChars = L3 视图容量）
     cfg: { ...MEM_DEFAULTS, ...(cfg.memoryCfg || {}), summarizeMode: 'deferred' },
   })
