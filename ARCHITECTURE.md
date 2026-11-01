@@ -1384,3 +1384,102 @@ link 安装的插件 **import 不到** dsh 自己的包，三个解法：
 **`memory5.mjs` 一行都不用改**——它只依赖 `{ text, speaker, channel, at }` 这种纯数据。
 `compaction.mjs` 只依赖 `session.surface.nodes` / `eventAt` / `append` 三个方法，
 适配层写个小 shim 就能复用。
+
+---
+
+## 20. 设置页：DSH「设置 → 记忆」（2026-11-01，v0.4.0）
+
+> 之前只能在 `~/.dsh/storages/memory-v5/config.json` 里手改，改错一个逗号插件就起不来。
+> 现在有了图形界面，12 个字段分 5 组，外加只读运行状态。
+
+### 为什么手写界面，不用 schemastery
+
+dsh 的自动表单要 `@deepseek-ai/schemastery` 声明 schema，**link 安装的插件 import 不到**
+（同 `defineTool` / `CompactionEngine` 那个坑，见 19.5）。所以走「自己开 HTTP 接口 + 自己写 React 组件」：
+
+```
+package.json
+  "dsh": { "client": { "platform": "web", "inject": [] } }
+  "exports": { "./client": "./client.mjs" }
+
+client.mjs    浏览器端：React section
+settings.mjs  服务端：/dsh-memory/api/*
+```
+
+### 客户端：三个关键点
+
+```js
+window.__ModuleLoader__.load({
+  id: 'dsh-memory-tiers',
+  factory: (require) => {
+    const React = require('react')            // 宿主提供的 react
+    const { createElement: h } = React
+    // ...组件...
+    exports.apply = apply
+    return module.exports
+  },
+})
+
+const inject = ['slots']
+function apply(ctx) {
+  ctx.effect(() => ctx.slots.inject('settings.section', () =>
+    ctx.slots.register(
+      { name: 'settings.section', id: 'memory-tiers', order: 7, label: () => '记忆' },
+      MemoryTiersSection,
+    )))
+}
+```
+
+- 模块不是标准 ESM，是 **`window.__ModuleLoader__.load({id, factory})`**（照抄 dsh-bili-whale）
+- `require('react')` 由宿主注入，**不需要打包工具**（手写 47KB 也能跑，没有 devDependencies）
+- CSS 通过 `<style data-dmt=…>` 注入，颜色用 `--dsw-alias-*` 变量，深浅色主题自适应
+
+`order: 7` 排在养鱼（6）后面。`label()` 是函数，支持后续改文案不用重载。
+
+### 服务端：一个路径只能注册一个 handler
+
+```js
+ctx.webServer.register({ kind: 'exact', path: '/dsh-memory/api/settings', handler })
+```
+
+> ⚠️ **踩过的坑**：读和写注册成两个 handler（同一路径两次），宿主「首个匹配即终止」，
+> 结果 GET 200 而 POST 405。必须**合成一个 handler，内部按 `req.method` 分派**。
+> 这个坑 dsh-bili-whale 的源码注释里提过，我们还是踩了一遍。
+
+字段写入走**白名单**（`WRITABLE` 表），前端传 `dir`、`evil` 都会被忽略——
+配置目录不能让前端改，否则等于开了任意路径写文件。
+
+### 界面结构
+
+| 分组 | 字段 |
+|---|---|
+| 运行状态（只读） | L1/L2/L3/DL3 条数、向量数、数据目录、语义检索开关 |
+| 模型连接 | `apiKey`（密码框）、`apiBase` |
+| 三层容量 | `memoryCfg.hotMaxChars` / `consolidateMaxChars` / `longMaxChars` |
+| 上下文注入 | `injectHot`、`refreshMinMs` |
+| 历史压缩 | `autoCompact`、`compactKeepTurns`、`compactArchiveChars` |
+| 写入捕获 | `userCaptureChars`、`toolCaptureChars` |
+| 底部 | `capture.log` 最后 15 行（每轮的归档与压缩记录） |
+
+### 改配置需要重启
+
+保存只写 `config.json`，运行中的 `mem` 实例不会重建。面板上明确写了「重启 dsh 后生效」。
+
+要做热重载的话，得在保存接口里 dispose 旧 `mem` 再 `createMemory5` 一遍，
+但内存里的分层状态、队列、定时器都要跟着重建，风险大于收益——**现阶段就要求重启**。
+
+### 验证
+
+```
+注册的路由: /dsh-memory/api/settings:exact, /dsh-memory/api/log:exact
+
+GET  → HTTP 200, config: apiKey/bootMaxChars/injectHot/memoryCfg
+       live: {counts:{L1:0,L2:0,L3:0,DL1:0,DL2:0,DL3:0}, vectors:0, semantic:true}
+POST → HTTP 200, applied: ["apiKey","injectHot","memoryCfg.hotMaxChars","memoryCfg.longMaxChars"]
+       ignored: []  needRestart: true
+       落盘正确；传 dir / evil 被白名单挡住
+
+客户端: 模块加载 → 导出 apply/inject/MemoryTiersSection/FIELDS
+        12 个字段 / 5 个分组
+        slots.register({name:'settings.section', id:'memory-tiers', order:7, label:'记忆'})
+```
