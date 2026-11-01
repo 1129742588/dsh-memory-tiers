@@ -1538,3 +1538,76 @@ const keepStart = keepTurns === 0 ? nodes.length : userIdx[userIdx.length - keep
 ```json
 { "injectHot": true, "compactKeepTurns": 0 }
 ```
+
+---
+
+## 21. 模型分阶段配置（2026-11-01，v0.5.0）
+
+> 背景：原来四个模型角色（向量 / 重排 / 轻任务 / 摘要）**共用一套 `apiKey` + `apiBase`**，
+> 设置页也没暴露，等于绑死在硅基流动上。现在每个阶段都能单独指定 `{ base, apiKey, model }`。
+
+### 四个阶段
+
+| 阶段 | 干什么 | 调用频率 | 默认模型 |
+|---|---|---|---|
+| `embed` | 向量化，检索和入库判重的基础 | 每条记忆 1 次 | `Qwen/Qwen3-Embedding-0.6B` |
+| `rerank` | 检索结果精排 | 每次检索 | `Qwen/Qwen3-Reranker-0.6B` |
+| `chat` | 判重、判矛盾、分类等高频小任务 | 很频繁 | `inclusionAI/Ling-mini-2.0` |
+| `summary` | 把一批对话压成摘要 | 低频但重 | `deepseek-ai/DeepSeek-V4.1-Flash` |
+
+### 解析规则
+
+```js
+function stage(name) {
+  const over = cfg.models[name] || {}
+  const base   = over.base   || cfg.base       // 没覆盖就用顶层
+  const apiKey = over.apiKey || cfg.apiKey
+  const model  = over.model  || cfg[name + 'Model']   // 再退到默认模型名
+  return { base, apiKey, model, chat: base + '/chat/completions', embed: …, rerank: … }
+}
+```
+
+**优先级：`models[stage].x` > 顶层 `cfg.x` > 该阶段默认模型名。**
+空字符串是「删除这条覆盖、回落到顶层」，不是「设成空值」——这样前端不用区分“没填过”和“清空了”。
+
+配置示例（摘要单独走 DeepSeek 官方，其余留硅基流动）：
+
+```json
+{
+  "apiKey": "sk-siliconflow",
+  "apiBase": "https://api.siliconflow.cn/v1",
+  "models": {
+    "summary": {
+      "base": "https://api.deepseek.com",
+      "apiKey": "sk-deepseek",
+      "model": "deepseek-chat"
+    }
+  }
+}
+```
+
+### 实现要点
+
+- `chat()` 多了一个 `stage` 参数，内部用该阶段的 url 和 key 发请求——**摘要能挂到另一家**
+- `embed` / `rerank` 各自调 `stage('embed')` / `stage('rerank')`，不再直接用全局 `cfg.apiKey`
+- key 检查放宽：`cfg.apiKey || 任一 models[s].apiKey`，否则只配了摘要一家时会被误判为"没配"
+- `silicon.resolveStage(name)` 和 `silicon.stages()` 暴露给设置页，显示**实际生效**的值（覆盖已合并）
+
+### 验证
+
+```
+顶层硅基流动 + summary 单独挂 deepseek + embed 换 bge-m3：
+embed    {"base":"…siliconflow.cn/v1","model":"BAAI/bge-m3","hasKey":true}
+rerank   {"base":"…siliconflow.cn/v1","model":"Qwen/Qwen3-Reranker-0.6B","hasKey":true}
+chat     {"base":"…siliconflow.cn/v1","model":"inclusionAI/Ling-mini-2.0","hasKey":true}
+summary  {"base":"https://api.deepseek.com","model":"deepseek-chat","hasKey":true}
+
+设置页写入 → applied: ["models.summary.base","models.summary.apiKey","models.summary.model"]
+清空 base → 该键被删除，回落顶层（不是留一个空字符串）
+全空 → 抛「缺少 apiKey（顶层或某个阶段的 models[s].apiKey）」
+```
+
+### 一个提醒
+
+换 `embed` 模型会导致**向量维度变化**，旧库的向量全部作废。真要换得清空 `vectors-part-*.json` 并重建，
+否则检索结果会乱。设置页的提示里写了这条。

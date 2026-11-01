@@ -319,7 +319,34 @@ const RESULT_PATTERNS = /(跑通|改完|部署|提交|补完|删掉|清理|扩�
 
 export function createSilicon(options = {}) {
   const cfg = { ...DEFAULTS, ...options }
-  if (!cfg.apiKey) throw new Error('[silicon] 缺少 apiKey')
+  // models 段允许每个阶段单独覆盖 { base, apiKey, model }，留空则继承顶层的 base/apiKey
+  if (!cfg.models || typeof cfg.models !== 'object') cfg.models = {}
+
+  const STAGES = ['embed', 'rerank', 'chat', 'summary']
+
+  /**
+   * 解析某个阶段的最终连接参数。
+   * 优先级：models[stage].xxx > 顶层 cfg.xxx > 该阶段的默认模型名。
+   * 这样既能"全部走硅基流动"，也能"摘要单独挂 DeepSeek 官方、向量走本地服务"。
+   */
+  function stage(name) {
+    const over = cfg.models[name] || {}
+    const base = String(over.base || cfg.base || '').replace(/\/+$/, '')
+    const apiKey = over.apiKey || cfg.apiKey || ''
+    const model = over.model || cfg[name + 'Model'] || ''
+    return {
+      base,
+      apiKey,
+      model,
+      chat: base + '/chat/completions',
+      embed: base + '/embeddings',
+      rerank: base + '/rerank',
+    }
+  }
+
+  // 只要任意一个阶段拿到了 key 就能跑；全部为空才认为没配（由调用方降级到本地哈希向量）
+  const anyKey = cfg.apiKey || STAGES.some((s) => cfg.models?.[s]?.apiKey)
+  if (!anyKey) throw new Error('[silicon] 缺少 apiKey（顶层或某个阶段的 models[s].apiKey）')
 
   const chatUrl = `${cfg.base.replace(/\/+$/, '')}/chat/completions`
   const embedUrl = `${cfg.base.replace(/\/+$/, '')}/embeddings`
@@ -404,21 +431,26 @@ export function createSilicon(options = {}) {
     const {
       maxTokens = 400,
       temperature = 0,
-      model = cfg.chatModel,
+      stage: stageName = 'chat',
+      model,
       timeout = cfg.timeoutMs,
       thinking = false,
     } = opts
 
+    const st = stage(stageName)
+    const useModel = model || st.model
+
     const body = {
-      model,
+      model: useModel,
       messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
       max_tokens: maxTokens,
       temperature,
     }
     if (thinking === false) body.enable_thinking = false
 
-    const d = await post(chatUrl, cfg.apiKey, body, timeout, cfg.retries, cfg.maxConcurrent, cfg.rateLimitRetries, cfg.rateLimitBaseMs, guard)
-    note('chat', d.usage?.total_tokens, model)
+    // ★ 用该阶段自己的 url / key：摘要可以挂到另一家 provider 上
+    const d = await post(st.chat, st.apiKey, body, timeout, cfg.retries, cfg.maxConcurrent, cfg.rateLimitRetries, cfg.rateLimitBaseMs, guard)
+    note(stageName, d.usage?.total_tokens, useModel)
     return (d.choices?.[0]?.message?.content || '').trim()
   }
 
@@ -429,7 +461,8 @@ export function createSilicon(options = {}) {
     const list = (Array.isArray(texts) ? texts : [texts]).map((t) => String(t || '').trim()).filter(Boolean)
     if (!list.length) return null
     try {
-      const d = await post(embedUrl, cfg.apiKey, { model: cfg.embedModel, input: list }, cfg.timeoutMs, cfg.retries, cfg.maxConcurrent, cfg.rateLimitRetries, cfg.rateLimitBaseMs, guard)
+      const es = stage('embed')
+      const d = await post(es.embed, es.apiKey, { model: es.model, input: list }, cfg.timeoutMs, cfg.retries, cfg.maxConcurrent, cfg.rateLimitRetries, cfg.rateLimitBaseMs, guard)
       note('embed', d.usage?.total_tokens || d.meta?.tokens?.input_tokens)
       const vecs = (d.data || []).map((x) => x.embedding)
       return vecs.length === list.length ? vecs : null
@@ -443,9 +476,10 @@ export function createSilicon(options = {}) {
     const list = (docs || []).map((t) => String(t || ''))
     if (!list.length) return null
     try {
-      const body = { model: cfg.rerankModel, query: String(query || ''), documents: list }
+      const rs = stage('rerank')
+      const body = { model: rs.model, query: String(query || ''), documents: list }
       if (topN > 0) body.top_n = Math.min(topN, list.length)
-      const d = await post(rerankUrl, cfg.apiKey, body, cfg.timeoutMs, cfg.retries, cfg.maxConcurrent, cfg.rateLimitRetries, cfg.rateLimitBaseMs, guard)
+      const d = await post(rs.rerank, rs.apiKey, body, cfg.timeoutMs, cfg.retries, cfg.maxConcurrent, cfg.rateLimitRetries, cfg.rateLimitBaseMs, guard)
       note('rerank', d.meta?.tokens?.input_tokens)
       return (d.results || []).map((x) => ({ index: x.index, score: Number(x.relevance_score) }))
     } catch {
@@ -524,7 +558,7 @@ export function createSilicon(options = {}) {
         // 再留 250 给"多写一行"的余量。上限 4000 是模型的安全区。
         maxTokens: Math.min(250 + 10 * list.length, 4000),
         temperature: 0.2,
-        model: cfg.summaryModel,
+        stage: 'summary',
         timeout: cfg.summaryTimeoutMs,
         // ★ 必须显式关掉推理。
         //   这里原来传的是 null，而 chat() 里只处理 `thinking === false`，
@@ -656,7 +690,7 @@ export function createSilicon(options = {}) {
       const out = await chat(sys, user, {
         maxTokens: Math.min(300 + 12 * list.length, 4000),
         temperature: 0.2,
-        model: cfg.summaryModel,
+        stage: 'summary',
         timeout: cfg.summaryTimeoutMs,
         thinking: false,
       })
@@ -869,15 +903,31 @@ export function createSilicon(options = {}) {
       ms: Date.now() - t0,
       dim: v[0].length,
       models: {
-        embed: cfg.embedModel,
-        rerank: cfg.rerankModel,
-        chat: cfg.chatModel,
-        summary: cfg.summaryModel,
+        // 显示**实际生效**的值（阶段覆盖已合并），而不是原始配置
+        embed: stage('embed').model,
+        rerank: stage('rerank').model,
+        chat: stage('chat').model,
+        summary: stage('summary').model,
+      },
+      endpoints: {
+        embed: stage('embed').base,
+        rerank: stage('rerank').base,
+        chat: stage('chat').base,
+        summary: stage('summary').base,
       },
     }
   }
 
-  return { embed, rerank, summarize, summarizeWithSources, classify, classifyBatch, sameEvent, relation, ping, cos, config: cfg, usage, resetUsage, budget }
+  return {
+    embed, rerank, summarize, summarizeWithSources, classify, classifyBatch, sameEvent, relation, ping, cos,
+    config: cfg, usage, resetUsage, budget,
+    /** 给设置页/诊断用：某阶段最终解析成什么 */
+    resolveStage: (name) => {
+      const st = stage(name)
+      return { base: st.base, model: st.model, hasKey: !!st.apiKey }
+    },
+    stages: () => STAGES,
+  }
 }
 
 /** 从 AstrBot 的 cmd_config.json 里取 siliconflow 的 key，省去手抄 */

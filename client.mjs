@@ -94,6 +94,55 @@ window.__ModuleLoader__.load({
       },
 
       {
+        group: '模型（每个阶段可分开指定，留空走默认）',
+        path: ['models', 'summary', 'model'],
+        label: '摘要模型',
+        type: 'text',
+        wide: true,
+        hint: '把一批对话压成摘要用哪个。留空 = deepseek-ai/DeepSeek-V4.1-Flash。摘要量最大，想单独走一家便宜的就填这里，并配上下面两项地址和 key。',
+      },
+      {
+        group: '模型（每个阶段可分开指定，留空走默认）',
+        path: ['models', 'summary', 'base'],
+        label: '摘要 API 地址',
+        type: 'text',
+        wide: true,
+        hint: '留空 = 用上面「模型连接」里的 API 地址。例：https://api.deepseek.com',
+      },
+      {
+        group: '模型（每个阶段可分开指定，留空走默认）',
+        path: ['models', 'summary', 'apiKey'],
+        label: '摘要 API Key',
+        type: 'password',
+        wide: true,
+        hint: '留空 = 用上面的 API Key。填了就表示摘要单独走另一家。',
+      },
+      {
+        group: '模型（每个阶段可分开指定，留空走默认）',
+        path: ['models', 'chat', 'model'],
+        label: '轻任务模型',
+        type: 'text',
+        wide: true,
+        hint: '判重、判矛盾、分类这些高频小任务，选快而便宜的。留空 = inclusionAI/Ling-mini-2.0。',
+      },
+      {
+        group: '模型（每个阶段可分开指定，留空走默认）',
+        path: ['models', 'embed', 'model'],
+        label: '向量模型',
+        type: 'text',
+        wide: true,
+        hint: '检索和入库判重都靠它。留空 = Qwen/Qwen3-Embedding-0.6B。换模型后向量维度不同，旧库要重建。',
+      },
+      {
+        group: '模型（每个阶段可分开指定，留空走默认）',
+        path: ['models', 'rerank', 'model'],
+        label: '重排模型',
+        type: 'text',
+        wide: true,
+        hint: '检索结果精排。留空 = Qwen/Qwen3-Reranker-0.6B。',
+      },
+
+      {
         group: '三层容量（决定每轮注入多少字）',
         path: ['memoryCfg', 'hotMaxChars'],
         label: 'L1 即时层',
@@ -301,6 +350,20 @@ window.__ModuleLoader__.load({
           ),
           h('div', { className: 'dmt-msg ' + (live?.semantic ? 'dmt-ok' : '') }, live?.semantic ? '开' : '关'),
         ),
+        live?.models
+          ? h('div', { className: 'dmt-row' },
+              h('div', null,
+                h('div', { className: 'dmt-label' }, '实际生效的模型'),
+                h('div', { className: 'dmt-hint' }, '留空的项已回落到顶层配置或默认值。改完需重启才会重新解析。'),
+              ),
+              h('div', {
+                className: 'dmt-mono',
+                style: { whiteSpace: 'pre-line', textAlign: 'right' },
+              }, Object.entries(live.models)
+                .map(([k, v]) => k + ': ' + (v.model || '?') + ' @ ' + String(v.base || '').replace(/^https?:\/\//, ''))
+                .join('\n')),
+            )
+          : null,
 
         // ── 配置字段 ──
         ...GROUPS.map((g) =>

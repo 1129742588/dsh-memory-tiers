@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-tiers",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "六层记忆插件：L1/L2/L3 活跃层 + DL1/DL2/DL3 深层，自动捕获写入、摘要沉淀、按需召回，并接管历史压缩（零 LLM）。",
   "type": "module",
   "main": "index.mjs",

@@ -34,6 +34,10 @@ const MEMORY_CFG_WRITABLE = {
   dl2MaxChars: 'number',
 }
 
+/** 每个模型阶段可单独覆盖的连接参数；留空字符串 = 清除覆盖、回落到顶层 */
+const STAGES = ['embed', 'rerank', 'chat', 'summary']
+const STAGE_FIELDS = { base: 'string', apiKey: 'string', model: 'string' }
+
 function json(res, code, obj) {
   const body = JSON.stringify(obj)
   res.statusCode = code
@@ -86,7 +90,7 @@ function coerce(kind, value) {
  * @returns {() => void} disposer；webServer 不可用时返回 null
  */
 export function installSettingsApi(ctx, opts) {
-  const { dir, getCfg, log, mem } = opts
+  const { dir, getCfg, log, mem, getModels } = opts
   const webServer = ctx.webServer
   if (!webServer?.register) return null
 
@@ -138,8 +142,13 @@ export function installSettingsApi(ctx, opts) {
           dir,
           counts: stats?.count ?? null,
           vectors: stats?.vectors ?? null,
-          semantic: !!(live.apiKey || process.env.SILICONFLOW_API_KEY),
+          semantic: !!(live.apiKey || process.env.SILICONFLOW_API_KEY ||
+            Object.values(live.models || {}).some((m) => m?.apiKey)),
           autoCompact: live.autoCompact !== false,
+          // 各阶段最终解析成什么（覆盖已合并），设置页拿来显示"实际生效"
+          models: (() => {
+            try { return getModels?.() ?? null } catch { return null }
+          })(),
         },
         configPath: cfgPath,
       })
@@ -178,6 +187,29 @@ export function installSettingsApi(ctx, opts) {
         applied.push('memoryCfg.' + k)
       }
       next.memoryCfg = mc
+    }
+
+    // ── 每阶段模型覆盖 ──
+    // 语义：填了就覆盖，留空（空字符串）= 删掉这条覆盖，回落到顶层的 apiKey/apiBase 和默认模型名。
+    // 这样「全走一家」和「摘要单独挂别家」都能表达，不用区分"没填过"和"清空了"。
+    if (incoming.models && typeof incoming.models === 'object') {
+      const mm = { ...(cur.models || {}) }
+      for (const st of STAGES) {
+        const src = incoming.models[st]
+        if (!src || typeof src !== 'object') continue
+        const dst = { ...(mm[st] || {}) }
+        for (const [k, kind] of Object.entries(STAGE_FIELDS)) {
+          if (!(k in src)) continue
+          const v = coerce(kind, src[k])
+          if (v === undefined) { ignored.push(`models.${st}.${k}`); continue }
+          if (v === '') delete dst[k]
+          else dst[k] = v
+          applied.push(`models.${st}.${k}`)
+        }
+        if (Object.keys(dst).length) mm[st] = dst
+        else delete mm[st]
+      }
+      next.models = mm
     }
 
     try {

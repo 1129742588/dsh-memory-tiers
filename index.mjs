@@ -212,6 +212,10 @@ export function apply(ctx, config = {}) {
         compactKeepTurns: 1,
         compactArchiveChars: 1200,
         memoryCfg: { longMaxChars: 4000 },
+        // 每个模型阶段可单独覆盖 { base, apiKey, model }；留空继承顶层 apiKey/apiBase。
+        // 例：想让它摘要走 DeepSeek 官方而不走硅基流动
+        //   models: { summary: { base: 'https://api.deepseek.com', apiKey: 'sk-...', model: 'deepseek-chat' } }
+        models: {},
         _说明: [
           'apiKey 填硅基流动的 key（也可以设环境变量 SILICONFLOW_API_KEY）；',
           '留空则用本地哈希向量，语义检索会变弱。改完重启 dsh 生效。',
@@ -232,7 +236,13 @@ export function apply(ctx, config = {}) {
   let silicon = null
   if (auth) {
     try {
-      silicon = createSilicon({ apiKey: auth.apiKey, base: auth.base, budgetTokens: cfg.budgetTokens })
+      silicon = createSilicon({
+        apiKey: auth.apiKey,
+        base: auth.base,
+        budgetTokens: cfg.budgetTokens,
+        // 每个阶段可单独指定 { base, apiKey, model }；留空继承上面的 apiKey/base
+        models: cfg.models || {},
+      })
     } catch (err) {
       log.warn?.('[memory-tiers] silicon 初始化失败：%s', err?.message ?? err)
     }
@@ -553,7 +563,18 @@ export function apply(ctx, config = {}) {
   // ── 设置页的服务端接口：读写 config.json（前端见 client.mjs） ──
   //    webServer 可能比插件晚就绪，用 inject 等它，而不是直接读 ctx.webServer。
   ctx.inject(['webServer'], (c) => {
-    const off = installSettingsApi(c, { dir, getCfg: () => cfg, log, mem })
+    const off = installSettingsApi(c, {
+      dir,
+      getCfg: () => cfg,
+      log,
+      mem,
+      getModels: () => {
+        if (!silicon?.resolveStage) return null
+        const out = {}
+        for (const st of silicon.stages()) out[st] = silicon.resolveStage(st)
+        return out
+      },
+    })
     if (typeof off === 'function') {
       try { c.effect(() => off, 'memory-tiers: settings api') } catch { /* 老版本没有 effect 也不影响接口可用 */ }
     } else {
