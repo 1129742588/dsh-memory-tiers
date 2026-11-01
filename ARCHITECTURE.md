@@ -39,14 +39,15 @@
 
 | 版本     | 日期    | 改了什么                                                              | 节       |
 | ------ | ----- | ----------------------------------------------------------------- | ------- |
+| —      | 11-01 | **文档二次校正**：清掉 `injectHot` 的全量残留（它已删除、三层恒定注入）；第 18 节默认改为**完全取替**；第 21 节默认模型改为 BAAI 那对；README 同步 | 16、18、20、21 |
 | v0.6.0 | 11-01 | **刷新机制改造**：`refreshMinMs` 从「节流整个记忆块」改为只节流 **L3 视图（DL3 排序）**，L1/L2 随写随带；移除 `injectHot` 开关（三层恒定注入）；历史压缩退出设置页（默认完全取替）；API Key 挪到嵌入与重排下      | 16、20   |
 | —      | 11-01 | **文档整理**：按主题分 A–D 四个区并加可见分界；删除重复的第 23 节；README 同步（版本号、文件清单、过时断言）  | 全文      |
-| v0.6.0 | 11-01 | 新库默认 `compactKeepTurns: 0`；清掉本地哈希向量在注释和文案里的残留（`injectHot` 随后被移除） | 16、23   |
+| v0.6.0 | 11-01 | 新库默认 `compactKeepTurns: 0`；清掉本地哈希向量在注释和文案里的残留                  | 16、23   |
 | v0.6.0 | 11-01 | 模型配置改版：`preset` 预设 + 融合/摘要可跟随**当前会话模型**；设置页顶部加每层条数/字数             | 24      |
 | v0.5.2 | 11-01 | **删除本地哈希向量**。无模型时语义层整体关闭（不读不写向量），宁可没有也不假装有                        | 23      |
 | v0.5.1 | 11-01 | 向量指纹 `vectors.meta.json` + `reindex.mjs`：同维度换 embed 模型会静默污染       | 22      |
 | v0.5.0 | 11-01 | 四个模型阶段（embed/rerank/chat/summary）可各自指定 base / apiKey / model      | 21      |
-| —      | 11-01 | `compactKeepTurns: 0` 改为显式支持；更正「L1 每轮变会打掉缓存」这条过期结论                | 16、20 末 |
+| —      | 11-01 | `compactKeepTurns: 0` 改为显式支持（后来成为默认）；更正「L1 每轮变会打掉缓存」这条过期结论 → 见第 16 节「记忆刷新」 | 16、18 |
 | v0.4.0 | 11-01 | 设置页（设置 → 记忆）：12 字段 5 分组 + 只读运行状态                                  | 20      |
 
 > 2026-10-31 及更早的改动按主题散落在第 6、12、18 节（均含实测数据），不在此表重复。
@@ -276,13 +277,13 @@ score = importance × heat
 
 | 参数                     | 默认           | 说明                                                                 |
 | ---------------------- | ------------ | ------------------------------------------------------------------ |
-| `hotMaxChars`          | 1500         | L1 容量（字）                                                           |
+| `hotMaxChars`          | 2000         | L1 容量（字）。**同时就是注入量**，没有独立上限                                       |
 | `hotMaxItems`          | 200          | L1 容量（条）                                                           |
-| `consolidateMaxChars`  | 3000         | L2 容量（字）                                                           |
+| `consolidateMaxChars`  | 2500         | L2 容量（字）                                                           |
 | `consolidateMaxItems`  | 120          | L2 容量（条）                                                           |
 | `consolidateDays`      | 0            | **已弃用**（L2 不按时间到期）                                                 |
-| `longMaxChars`         | 1500         | L3 视图容量（字）                                                         |
-| `dl2MaxChars`          | 60000        | DL2 容量                                                             |
+| `longMaxChars`         | 2000         | L3 视图容量（字）。新库模板覆盖成 4000（`config.json` 的 `memoryCfg`）                  |
+| `dl2MaxChars`          | 12000        | DL2 容量                                                             |
 | `dl2CompressTarget`    | 400          | 单条超这么多字才值得压缩                                                       |
 | `allowModelCompress`   | false        | 模型压缩默认关闭（实测减不掉字）                                                   |
 | `routeMode`            | `citation`   | 路由依据：摘要引用，不用重要度数值                                                  |
@@ -299,6 +300,7 @@ score = importance × heat
 | `heatRepeatCap`        | 20           | 强度封顶                                                               |
 | `heatPromoteThreshold` | 1.0          | 热度 ≥ 这个 → 有资格升长久层                                                  |
 | `budgetTokens`         | 0            | 进程级 token 预算，0 = 不限                                                |
+| `viewRefreshMs`       | 1800000      | **L3 视图（DL3 排序）的重算间隔**。全局唯一一处节流，见第 16 节「记忆刷新」；改 `longMaxChars` 会立刻重算 |
 
 ---
 
@@ -929,7 +931,7 @@ dsh 的缓存是**前缀缓存**——从第一个 token 开始匹配，一旦�
 2. **内容错**：L1「刚发生的」是当前会话的对话——**历史里本来就有**，注入等于每轮重说一遍，还每轮变。
 3. **机制错**：用 `section()` 塞系统提示词，变化必然导致后续前缀失效。
 
-### 修法：换成追加式快照 + 砍掉 L1 + 节流
+### 修法：换成追加式快照（含两处后续更正）
 
 **① 用 `systemPrompt.context()` 代替 `section()`**
 
@@ -943,30 +945,30 @@ dsh 有两套注入接口，语义完全不同：
 
 系统提示词因此变成逐字节不变 → 首轮之后全量命中缓存。
 
-**② L1 默认不注入（`injectHot: false`）—— 但这条理由后来被更正了**
+**② 三层恒定注入（2026-11-01 定稿：`injectHot` 已删除）**
 
-> **⚠️ 2026-11-01 更正**：这里原先写的是「L1 每轮都变 → 注入块每轮变化 → **打掉缓存**」。
-> 那个结论只在 `section()` 时代成立。改用 `context()` 之后，记忆块是**追加**的 user 快照，
-> 位置在末尾，**前面历史缓存完全不受影响**。用户当场指出了这点，是对的。
+> **⚠️ 这条理由被推翻过一次**。原先写的是「L1 每轮都变 → 注入块每轮变化 → **打掉缓存**」，
+> 据此把 `injectHot` 默认关掉。但那条结论只在 `section()` 时代成立——记忆块塞在系统提示词里，
+> 一变后面全废。改用 `context()` 之后，记忆块是**追加**的 user 快照、位置在末尾，
+> **前面历史缓存完全不受影响**。用户当场指出了这点，是对的。
 >
-> 真实成本只剩下「每轮多追加一条快照」，而 L1 通常只有几百到一千多字 —— 很小。
-> 所以 `injectHot` 该不该开，取决于下面的**配套关系**，不是缓存问题。
+> 开关赖以存在的理由没了，所以不是「改个默认值」，而是**把 `injectHot` 整个删除**
+> （配置项和代码一起，现在根本不读它）。
 
-`injectHot` 和 `compactKeepTurns` 必须配套：
+现在的行为：**L1 / L2 / L3 恒定全部注入**，可调的只有各自容量
+（`memoryCfg.hotMaxChars` / `consolidateMaxChars` / `longMaxChars`）。
 
-| 组合 | 模型能看到最近对话吗 | 说明 |
-|---|---|---|
-| `keepTurns=1` + `injectHot=false` | 能（靠 dsh 历史） | 默认。快照稳定、不重复付费；代价是历史留 1 轮原文 |
-| **`keepTurns=0` + `injectHot=true`** | 能（**只能靠 L1 快照**） | 彻底接管：dsh 历史一条不留，最近原话由 L1 提供 |
-| `keepTurns=0` + `injectHot=false` | **不能，完全失忆** | 禁用组合 |
+成本是每轮多追加一条快照（L1 通常几百到一千多字，按全价计费），换来的是
+**dsh 历史可以一条不留**——最近原话由 L1 提供，`compactKeepTurns` 因此能设成 0（见第 18 节）。
 
 跨会话恢复始终靠 L2/L3（沉淀过的）+ `memory_search`（按需检索）。
 
-**③ 节流（`refreshMinMs`，默认 5 分钟）**
+**③ 节流（已推翻，现行机制见本节末尾）**
 
-L3 视图按 `importance × heat` 截取，而 heat 随时间衰减，边界条目的分数会此消彼长，
-入选集合偶尔变一条 → 文本变化 → 快照刷新。5 分钟内的变化先压住，返回上一次的文本。
-记忆晚几分钟进上下文没人察觉，但省下的是真金白银。
+> **⚠️ 2026-11-01 重写**：这里原来的做法是「把**整个记忆块**压着 5 分钟不刷新」。
+> 这是错的——刚写进 L1 的话要等半天才进上下文，而快照是追加在末尾的，压住它没省下任何缓存。
+> 现行机制是**只节流 L3 视图（DL3 排序）**，见「记忆刷新：只有 L3 需要节流」。
+> 下面「效果」里的数字是 2026-10-31 实测，当时还是 `keepTurns=1` + 不注入 L1 的配置。
 
 ### 效果
 
@@ -1257,7 +1259,8 @@ capture.log: turn 归档 user=1 tool=3 rows=4 written=4 L1=4
 ```
 turn/end 事件
   → ① 本轮消息写进 L1（K1 修好后 user + action 都记）
-  → ② compactSurface()：把除最近 1 轮以外的历史压成一条 20 字占位
+  → ② compactSurface()：把除最近 N 轮以外的历史压成一条 20 字占位
+       N = compactKeepTurns，**默认 0**（= 全部压掉，见下面的「默认完全取替」）
         ├─ 先归档：被压掉的对话文本写进记忆（写失败就不压，宁大不丢）
         └─ 再替换：append 一条 user/message，surfaceOp = replace(startSeq, endSeq)
 ```
@@ -1287,16 +1290,30 @@ turn/end 事件
 
 ```json
 {
-  "autoCompact": true,          // 每轮结束自动压
-  "compactKeepTurns": 1,        // 保留最近 1 轮原文
+  "autoCompact": true,          // 每轮结束自动压（默认开）
+  "compactKeepTurns": 0,        // 保留最近几轮原文。**默认 0 = 一条不留**
   "compactArchiveChars": 1200   // 每次归档进记忆的字数上限
 }
 ```
 
-`compactKeepTurns: 0` 可以做到「只剩占位」，但那样模型完全看不见上一句问了什么，
-全靠记忆块——不建议，除非记忆块的 L1 注入打开了。
+> 这三项 **2026-11-01 起不再出现在设置页**（用户决定）：默认就是完全取替，没什么可调的；
+> 想多留点临时内容，把 L1 容量（`memoryCfg.hotMaxChars`）调大即可——L1 存的就是对话原话。
+> 要改仍然可以手改 `config.json`。
+
+### 默认完全取替：`compactKeepTurns: 0`
+
+`compactKeepTurns: 0` 现在是默认值：dsh 侧只剩 system + 一条占位，**历史完全由 L1 接管**。
+
+它成立的前提是**三层恒定注入**（L1 必须始终在上下文里，否则模型看不见上一句）。
+这个前提在 `injectHot` 开关删除后已经恒定满足，不再需要用户手动配对——
+早先文档里那张「`injectHot` × `keepTurns` 配套表」就是因为这个才存在的，现已作废（见第 16 节）。
+
+工作模式下想少压一点，见第 25 节（未实施）。
 
 ### 验证（本地 fixture，真 Session 对象，5 轮对话）
+
+> 下面是 2026-10-31 的实测输出，当时 `compactKeepTurns = 1`。
+> 现在默认 0，surface 恒定只剩 2 条（见第 20 节末尾的补充）。
 
 ```
 第 1 轮后 surface 条数: 2
@@ -1666,6 +1683,9 @@ ctx.webServer.register({ kind: 'exact', path: '/dsh-memory/api/settings', handle
 
 ### 验证
 
+> 下面是 **v0.4.0 时的输出**（当时有 `injectHot`、12 字段 5 分组）。
+> 现在的字段结构见上面的「界面结构」表，模型部分见第 24 节。
+
 ```
 注册的路由: /dsh-memory/api/settings:exact, /dsh-memory/api/log:exact
 
@@ -1704,21 +1724,22 @@ POST → HTTP 200, applied: ["apiKey","injectHot","memoryCfg.hotMaxChars","memor
 const keepStart = keepTurns === 0 ? nodes.length : userIdx[userIdx.length - keepTurns]
 ```
 
-**必须同时开 `injectHot: true`**，否则模型完全看不见上一句问了什么（见第 16 节的配套表）。
+**前提是三层恒定注入**（L1 必须在上下文里，否则模型看不见上一句）。
+`injectHot` 开关已在 v0.6.0 删除，现在是恒定行为，不再需要手动配对（见第 16 节 ②）。
 
 注入块对照（真实库）：
 
 | 配置 | 注入块 | 构成 |
 |---|---|---|
-| `injectHot: false` | 4625 字 ≈ 3083 token | L3 4150 + L2 458 |
-| `injectHot: true` | 6088 字 ≈ 4059 token | L3 4150 + L2 458 + L1 1455 |
+| 不含 L1（旧默认，开关已删） | 4625 字 ≈ 3083 token | L3 4150 + L2 458 |
+| **含 L1（现在恒定如此）** | 6088 字 ≈ 4059 token | L3 4150 + L2 458 + L1 1455 |
 
 每轮多约 1000 token（追加新快照，全价）——相对于「dsh 历史归零」这点代价可以接受。
 
 配置改动落在 `~/.dsh/storages/memory-v5/config.json`：
 
 ```json
-{ "injectHot": true, "compactKeepTurns": 0 }
+{ "compactKeepTurns": 0 }        // injectHot 已删除，三层恒定注入
 ```
 
 ---
@@ -1732,10 +1753,15 @@ const keepStart = keepTurns === 0 ? nodes.length : userIdx[userIdx.length - keep
 
 | 阶段 | 干什么 | 调用频率 | 默认模型 |
 |---|---|---|---|
-| `embed` | 向量化，检索和入库判重的基础 | 每条记忆 1 次 | `Qwen/Qwen3-Embedding-0.6B` |
-| `rerank` | 检索结果精排 | 每次检索 | `Qwen/Qwen3-Reranker-0.6B` |
-| `chat` | 判重、判矛盾、分类等高频小任务 | 很频繁 | `inclusionAI/Ling-mini-2.0` |
-| `summary` | 把一批对话压成摘要 | 低频但重 | `deepseek-ai/DeepSeek-V4.1-Flash` |
+| `embed` | 向量化，检索和入库判重的基础 | 每条记忆 1 次 | `BAAI/bge-m3` |
+| `rerank` | 检索结果精排 | 每次检索 | `BAAI/bge-reranker-v2-m3` |
+| `chat` | 判重、判矛盾、分类等高频小任务 | 很频繁 | 默认**跟随当前会话模型**（HTTP 时 `inclusionAI/Ling-mini-2.0`）|
+| `summary` | 把一批对话压成摘要 | 低频但重 | 默认**跟随当前会话模型**（HTTP 时 `deepseek-ai/DeepSeek-V4.1-Flash`）|
+
+> **v0.6.0 起默认值改了两处**（见第 24 节）：
+> ① embed / rerank 从 Qwen3 那对换成 **BAAI 那对**——硅基流动上免费、中文够用，
+>    且这对是同一家同代际的配套组合；换 embed 记得跑一次 `node reindex.mjs`（见第 22 节）。
+> ② chat / summary 默认 `source: session`，**直接用当前对话的模型**，不需要自己的 key。
 
 ### 解析规则
 
@@ -1772,12 +1798,13 @@ function stage(name) {
 
 - `chat()` 多了一个 `stage` 参数，内部用该阶段的 url 和 key 发请求——**摘要能挂到另一家**
 - `embed` / `rerank` 各自调 `stage('embed')` / `stage('rerank')`，不再直接用全局 `cfg.apiKey`
-|  |  |  |
-| --- | --- | --- |
 - key 检查放宽：`cfg.apiKey || 任一 models[s].apiKey`，否则只配了摘要一家时会被误判为"没配"
 - `silicon.resolveStage(name)` 和 `silicon.stages()` 暴露给设置页，显示**实际生效**的值（覆盖已合并）
 
 ### 验证
+
+> 下面是 **v0.5.0 时的输出**，当时 rerank 默认还是 Qwen3 那对。
+> v0.6.0 起默认已改成 BAAI 那对（见本节开头的表格）。
 
 ```
 顶层硅基流动 + summary 单独挂 deepseek + embed 换 bge-m3：
