@@ -4,7 +4,7 @@
  *
  * 为什么需要它：
  *   向量是模型输出的坐标，换模型 = 换坐标系。旧坐标在新坐标系里没有任何意义。
- *   更麻烦的是 hashEmbed / Qwen3-Embedding-0.6B / bge-m3 **都是 1024 维**，
+ *   更麻烦的是常用的几个模型（Qwen3-Embedding-0.6B / bge-m3）**都是 1024 维**，
  *   维度检查发现不了，cosine() 会照常算出数字——不报错，只是越来越不准。
  *
  * 用法：
@@ -52,7 +52,7 @@ const base = cfg.apiBase || 'https://api.siliconflow.cn/v1'
 
 if (!apiKey) {
   die(`没配 apiKey（${cfgPath} 的 "apiKey" 或环境变量 SILICONFLOW_API_KEY）。
-  没有 key 就只能用本地哈希向量，重建没有意义。`)
+  没有 key 就没有 embedding 模型，重建无从谈起（v0.5.2 起已不再用本地哈希向量兜底）。`)
 }
 
 let silicon
@@ -78,7 +78,7 @@ const metaPath = join(dir, 'vectors.meta.json')
 let meta = null
 try { meta = JSON.parse(readFileSync(metaPath, 'utf8')) } catch { /* 没有就是老库 */ }
 if (meta) console.log('现有向量 ', `${meta.count} 条 / ${meta.dim} 维 / 来自 ${meta.sig || '(未知)'}`)
-else console.log('现有向量 ', '(没有指纹文件，视为旧库或哈希向量)')
+else console.log('现有向量 ', '(没有指纹文件，视为旧库)')
 
 if (meta && meta.sig === signature && !has('--rebuild')) {
   console.log('\n✓ 指纹已经一致，不需要重建（确实想重嵌加 --rebuild）')

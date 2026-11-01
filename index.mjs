@@ -11,7 +11,9 @@
  * `session/event`。一轮对话里会有 user/message、tool/call、tool/result、turn/end。
  * 我们**按 turn 聚合**——中途写会得到「问了还没答」的半截对话，而且写入次数翻倍。
  *
- * 没有 embedding key 时降级为本地哈希向量：语义检索会退化，但链路能跑通、不会崩。
+ * 没有 embedding key 时语义层整体关闭（v0.5.2 起不再用本地哈希向量充数）：
+ * 检索只走关键词 + 热度，向量文件不读也不写，接上模型后原样可用。
+ * 融合 / 摘要不受影响——它们默认走 dsh 当前会话模型（v0.6.0），不需要自己的 key。
  */
 
 import { homedir } from 'node:os'
@@ -205,10 +207,10 @@ export function apply(ctx, config = {}) {
         userCaptureChars: 2000,
         toolCaptureChars: 500,
         budgetTokens: 0,
-        injectHot: false,
+        injectHot: true,               // 与 compactKeepTurns 配套，见 _说明
         refreshMinMs: 1800000,
         autoCompact: true,
-        compactKeepTurns: 1,
+        compactKeepTurns: 0,           // 0 = dsh 历史一条不留，全交给记忆（须开 injectHot）
         compactArchiveChars: 1200,
         memoryCfg: { longMaxChars: 4000 },
         // 每个模型阶段可单独覆盖。两种来源：
@@ -223,11 +225,13 @@ export function apply(ctx, config = {}) {
         noThink: { chat: true, summary: false },
         _说明: [
           'apiKey 填硅基流动的 key（也可以设环境变量 SILICONFLOW_API_KEY）；',
-          '留空则用本地哈希向量，语义检索会变弱。改完重启 dsh 生效。',
+          '留空则语义检索关闭：检索只走关键词，向量文件不读也不写（不造假向量）。',
+          '  融合 / 摘要不受影响，它们默认跟当前会话模型走。改完重启 dsh 生效。',
           'bootMaxChars = 总闸门，0 = 不限制（推荐）。注入多少由 memoryCfg 的三层容量自己决定。',
           'memoryCfg.longMaxChars = L3 视图容量（长期记忆能进上下文的字数）。',
-          'injectHot = 是否注入 L1「刚发生的」。默认 false：当前会话的对话本来就在历史里，',
-          '  重复注入会让注入块每轮变化，每轮多烧几千 token 的缓存。跨会话恢复靠 L2/L3 + 检索。',
+          'injectHot = 是否注入 L1「刚发生的」。默认 true：记忆块是追加在末尾的快照，',
+          '  前面历史的缓存不受影响（早先「会打掉缓存」的说法只在 section() 时代成立，已更正）。',
+          '  与 compactKeepTurns 配套：压成 0 时必须开 true，否则模型看不见上一句说了什么。',
           'refreshMinMs = 记忆块变化后的最小刷新间隔（毫秒），默认 1800000（30 分钟）。',
           'autoCompact = 每轮结束时把 dsh 自带历史压成一条占位（零 LLM），被压掉的内容先归档进记忆。',
           'compactKeepTurns = 压完保留最近几轮原文。默认 1：上下文恒定 = 系统提示 + 记忆块 + 最近 1 轮。',

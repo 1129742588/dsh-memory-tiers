@@ -1,14 +1,18 @@
 # dsh-memory-tiers · 六层记忆 + 历史压缩
 
-> **v0.3.0**（2026-10-31）。架构细节、实测数据、踩过的坑全在 [`ARCHITECTURE.md`](./ARCHITECTURE.md)。
+> **v0.6.0**（2026-11-01）。架构细节、实测数据、踩过的坑全在 [`ARCHITECTURE.md`](./ARCHITECTURE.md)。
 > 本文只讲「它干什么」和「怎么用」。
+>
+> 架构文档按主题分了 A–D 四个区，开头有**变更索引**（哪个版本改了什么、在第几节）。
+> 改代码前先看那里，别只看本文——本文为了好读，省略了大量约束和实测数据。
 
 ## 它做三件事
 
 1. **自动记忆**：订阅 `session/event`，每轮结束把你说的话、我调的工具写进记忆（L1），
    满了自动摘要沉淀到 L2/L3 和深层 DL1/DL2/DL3。
-2. **注入上下文**：每轮把 L3（长期摘要）+ L2（最近沉淀）作为一条 user 快照注入，
-   内容不变就不刷新，不打掉 prompt cache。
+2. **注入上下文**：每轮把 L3（长期摘要）+ L2（最近沉淀）+ L1（刚发生的，默认开）
+   作为一条 user 快照**追加**在末尾注入，内容不变就不刷新。
+   追加在末尾，所以前面历史的 prompt cache 不受影响。
 3. **接管历史压缩**：每轮结束把 dsh 自带的会话历史压成一条 20 字占位，
    **零 LLM 调用**，被压掉的内容先归档进记忆。上下文因此保持恒定，不随轮数增长。
 
@@ -20,9 +24,13 @@
 | `memory5.mjs` | 六层记忆核心：分层、热度、摘要、路由、检索、遗忘 |
 | `compaction.mjs` | 历史压缩：把 dsh 的 surface 压成占位，原文归档进记忆 |
 | `silicon.mjs` | 模型层：embed / 摘要 / 判关系（无 key 时语义检索关闭，只走关键词） |
+| `client.mjs` | 设置页前端（React section，挂 dsh「设置 → 记忆」） |
+| `settings.mjs` | 设置页后端：`/dsh-memory/api/*`，读写 config.json（字段白名单） |
+| `dshllm.mjs` | 借 dsh 自己的通道调**当前会话模型**（融合/摘要可跟它走，不用自己的 key） |
+| `reindex.mjs` | 换 embed 模型后重建向量库（`--dry` 可先体检） |
 | `cordis.patch.yml` | 告诉 dsh 怎么把插件插进配置树 |
 | `package.json` | 包信息，`dsh.bundle.patch` 是关键字段 |
-| `ARCHITECTURE.md` | 完整架构、实测数据、已知问题清单 |
+| `ARCHITECTURE.md` | 完整架构、实测数据、已知问题清单（**权威文档**） |
 
 ## 安装
 
@@ -59,13 +67,16 @@ export MEMORY_TIERS_DIR="~/my-memory"    # 或 D:/backup/memory
 npm pack --pack-destination ./dist
 ```
 
-产物 `dist/dsh-memory-tiers-0.3.0.tgz`，只含 `package.json` 里 `files` 列出的运行时文件
+产物 `dist/dsh-memory-tiers-<版本>.tgz`，只含 `package.json` 里 `files` 列出的运行时文件
 （测试、模拟脚本、数据集都不打进去）。**新增文件记得同步 `files`**，
 漏了会在安装后才炸（`ERR_MODULE_NOT_FOUND`）——`compaction.mjs` 就差点栽在这。
 
 ---
 
-## 以下是 v1 时代的设计笔记（保留作背景，与当前实现已有差异）
+## 以下是 v1 时代的设计笔记（**历史存档，勿照着改**）
+
+> ⚠️ 这一整段描述的是早期原型，和当前实现差异很大（层名、参数、检索方式都变了）。
+> 留着只作背景。**要改代码请以 `ARCHITECTURE.md` 为准**。
 
 
 ## 第一步：先看它跑起来（不用装 dsh）
@@ -144,18 +155,21 @@ cat ~/.dsh/storages/memory-tiers/status.json
 
 ## 想调什么，改哪里
 
-全在 `memory.mjs` 顶部的 `DEFAULTS`：
+**优先用设置页**：dsh → 设置 → 记忆（v0.4.0 起有界面，v0.6.0 又改版过）。
+改完**重启 dsh** 生效。它和直接改 `config.json` 写的是同一个文件。
+
+真正常动的是三层容量，它们直接决定每轮往上下文里塞多少字：
 
 | 参数 | 默认 | 含义 |
 |---|---|---|
-| `l1TtlDays` | 3 | 即时记忆几天不用就结算 |
-| `l1PromoteImportance` | 0.6 | 重要性够了就升长期 |
-| `l1PromoteAccess` | 2 | 被用过 2 次也升长期 |
-| `l2IdleDays` | 30 | 长期记忆多久没碰考虑下沉 |
-| `l2ArchiveScore` | 0.25 | 评分低于这个就沉到文件 |
-| `bootMaxChars` | 2000 | 每轮最多注入多少字 |
+| `memoryCfg.hotMaxChars` | 2000 | L1 容量，同时也是注入量（**没有独立上限**） |
+| `memoryCfg.consolidateMaxChars` | 2500 | L2 容量：重要原话留住，不重要的沉去 DL1 遗忘 |
+| `memoryCfg.longMaxChars` | 4000 | L3 容量：摘要视图，信息密度最高，可以放宽 |
+| `injectHot` | `true` | 是否注入 L1。与 `compactKeepTurns` 配套（见下） |
+| `compactKeepTurns` | `0` | 压完保留几轮原文。**设 0 必须把 `injectHot` 开成 true**，否则模型看不见上一句 |
 
-预算分配写在 `buildBlock()` 里：L1 拿 60%、L2 拿 35%、L3 只占一行——**冷存正文永远不进上下文**，这是省 token 的关键。
+> 深层（DL1/DL2/DL3）**不进上下文**，只在检索时命中，这是省 token 的关键。
+> 其余参数见 `ARCHITECTURE.md` 第 5 节（关键参数）。
 
 ## 排错对照表
 
@@ -164,11 +178,21 @@ cat ~/.dsh/storages/memory-tiers/status.json
 | 重启后没反应，也看不到工具 | `package.json` 的 `dsh.bundle.patch` 丢了，或 `cordis.patch.yml` 里的 `name` 和包名不一致 | 检查这两个字符串是否都是 `dsh-memory-tiers` |
 | 日志里出现"未能注入系统提示词" | 你这个 dsh 版本的 `systemPrompt` API 名字不一样 | 告诉我版本号，改 `index.mjs` 里 `injectPrompt()` 那 10 行 |
 | 工具能看到但不被调用 | 模型不知道什么时候该用 | 改工具的 `description`，把触发场景写具体 |
-| 记了一大堆但想不起来 | 召回是关键词匹配，命中率有限 | 先 `/memory` 看分布，再考虑换向量检索 |
+| 记了一大堆但想不起来 | 没填 `apiKey` 时语义检索是关的，只有关键词命中 | 填硅基流动 key，再跑 `node reindex.mjs` 补向量 |
 
 ## 一句实话
 
-这版是**能跑的 MVP**，不是成品。它的召回是两字组合的关键词匹配，够用但不够聪明；它的"蒸馏"是原样搬运，没有让模型总结压缩。这两块是后面真正拉开差距的地方——建议先用两周，等你真的被"想不起来"坑到了，再动手升级，否则你会一直在调你还没遇到的问题。
+> 这段是 v1 时代的判断，**两条都已不成立**：召回现在是「向量召回 + rerank 精排 + 关键词」
+> 三级流水线，蒸馏是真调模型的摘要。留着只是提醒自己别退回去。
+
+现在的实话是**：语义能力依赖你接没接模型**。
+
+- **接了模型**（填了硅基流动 key）：检索走向量 + rerank，入库能判重判矛盾，L1/L2 溢出有真摘要。
+- **没接模型**：语义检索直接关闭，检索只走关键词 + 热度——**不造假向量**。
+  但融合与摘要仍能工作，它们默认跟着**当前会话模型**走，不用你额外配 key。
+
+所以最小可用配置其实是「什么都不填」；想让检索变准，才需要去填 key。
+换过 embed 模型后记得跑一次 `node reindex.mjs`，否则旧条目只能靠关键词命中。
 
 ---
 
@@ -189,7 +213,7 @@ cat ~/.dsh/storages/memory-tiers/status.json
 
 1. 在会话里说一句「记住：我的项目路径是 D:/lung」
 2. **开一个新会话**，问「我的项目路径是什么？」——能答出来就说明跨会话生效了
-3. 打开 `C:\Users\Anxiple\.dsh\storages\memory-tiers\store.json`，能看到那条记录，`tier` 是 `L1`
+3. 打开 `~/.dsh/storages/memory-v5/store.json`，能看到那条记录，`layer` 是 `L1`
 
 ## 三个不明显的点
 
