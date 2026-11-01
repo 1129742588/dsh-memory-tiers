@@ -98,20 +98,21 @@ window.__ModuleLoader__.load({
     // ── 字段定义：改这里就能增减配置项（服务端白名单见 settings.mjs 的 WRITABLE） ──
     const FIELDS = [
       {
-        group: '模型连接',
+        group: '嵌入与重排',
         path: ['apiKey'],
         label: 'API Key',
         type: 'password',
         wide: true,
-        hint: '不填就没有语义检索（只走关键词命中，也没有摘要）。本插件不再用本地哈希向量充数。改完需重启。',
+        hint: '硅基流动的免费模型也要 key（去硅基流动官网领）。不填就没有语义检索，只走关键词。融合与摘要不受影响——它们默认跟当前会话模型走。改完需重启。',
       },
       {
-        group: '模型连接',
+        group: '嵌入与重排',
         path: ['apiBase'],
-        label: 'API 地址',
+        label: 'API 地址（两者共用）',
         type: 'text',
         wide: true,
-        hint: '默认 https://api.siliconflow.cn/v1。换别家兼容 OpenAI 接口的服务时改这里。',
+        showIf: (c) => (c?.preset || 'siliconflow') === 'custom',
+        hint: '嵌入与重排的默认地址；下面各自还能单独覆盖。留空 = https://api.siliconflow.cn/v1。',
       },
 
       {
@@ -261,40 +262,11 @@ window.__ModuleLoader__.load({
       },
 
       {
-        group: '上下文注入',
-        path: ['injectHot'],
-        label: '把 L1 也注入上下文',
-        type: 'boolean',
-        hint: '默认关。当前会话的对话本来就在历史里，重复注入会让注入块每轮变化、打掉 prompt cache。',
-      },
-      {
-        group: '上下文注入',
+        group: '三层容量（决定每轮注入多少字）',
         path: ['refreshMinMs'],
-        label: '记忆块刷新间隔（毫秒）',
+        label: 'L3 视图刷新间隔（毫秒）',
         type: 'number',
-        hint: '默认 1800000（30 分钟）。内容变了也要等过节流窗口才刷新，保护缓存。',
-      },
-
-      {
-        group: '历史压缩',
-        path: ['autoCompact'],
-        label: '自动压缩历史',
-        type: 'boolean',
-        hint: '每轮结束把宿主的会话历史压成一条占位，原文归档进记忆，不调用模型。',
-      },
-      {
-        group: '历史压缩',
-        path: ['compactKeepTurns'],
-        label: '保留最近几轮原文',
-        type: 'number',
-        hint: '默认 1。设 0 会让模型完全看不见上一句问了什么，不建议。',
-      },
-      {
-        group: '历史压缩',
-        path: ['compactArchiveChars'],
-        label: '单次归档字数上限',
-        type: 'number',
-        hint: '默认 1200。超出的部分截断收录，不会整段丢。',
+        hint: '默认 1800000（30 分钟）。只有 L3 需要节流：它排在注入块最前，一变后面 L2/L1 的缓存全断。L1/L2 不节流，写了就带上下一轮。',
       },
 
       {

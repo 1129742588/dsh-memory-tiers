@@ -14,8 +14,7 @@ const WRITABLE = {
   apiKey: 'string',
   apiBase: 'string',
   bootMaxChars: 'number',
-  injectHot: 'boolean',
-  refreshMinMs: 'number',
+  refreshMinMs: 'number',   // L3 视图（DL3 排序）刷新间隔；L1/L2 不节流
   autoCompact: 'boolean',
   compactKeepTurns: 'number',
   compactArchiveChars: 'number',

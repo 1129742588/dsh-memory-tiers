@@ -43,12 +43,13 @@ const PLUGIN_DEFAULTS = {
   autoCapture: true,          // 自动订阅 session/event 写入 L1
   userCaptureChars: 2000,     // 单条用户消息最多记多少字
   toolCaptureChars: 500,      // 工具输出截断（bash 一次能吐几万字，L1 才 1500 字）
-  injectHot: false,           // 是否把 L1「刚发生的」也注入。默认关：它每轮都变，会把缓存打掉
-  refreshMinMs: 30 * 60 * 1000, // 记忆块变化后的最小刷新间隔。快照是**追加**不是替换，刷新一次就多几百上千 token，别调太小
+  // L1/L2/L3 恒定注入，没有开关——三层就是上下文的全部「记忆」，可调的是各自容量。
+  refreshMinMs: 30 * 60 * 1000, // L3 视图（DL3 按热度×档位排序）的重算间隔。
+  //   L1/L2 不节流，每轮现算并追加在末尾；只有 L3 排在注入块最前，它一动后面缓存全断。
   flushEveryMs: 5 * 60 * 1000,
   sweepEveryMs: 6 * 60 * 60 * 1000,
   autoCompact: true,          // 每轮结束把 dsh 自带历史压成一条占位（零 LLM）
-  compactKeepTurns: 1,        // 保留最近几轮原文（太多上下文就大，太少模型没上下文）
+  compactKeepTurns: 0,        // 0 = 完全取替 dsh 会话历史（L1 里已经有历史了）
   compactArchiveChars: 1200,  // 每轮压缩归档进记忆的字数上限
 }
 
@@ -207,10 +208,9 @@ export function apply(ctx, config = {}) {
         userCaptureChars: 2000,
         toolCaptureChars: 500,
         budgetTokens: 0,
-        injectHot: true,               // 与 compactKeepTurns 配套，见 _说明
-        refreshMinMs: 1800000,
+        refreshMinMs: 1800000,         // L3 视图刷新间隔，见 _说明
         autoCompact: true,
-        compactKeepTurns: 0,           // 0 = dsh 历史一条不留，全交给记忆（须开 injectHot）
+        compactKeepTurns: 0,           // 0 = dsh 历史一条不留，全交给记忆（L1 就是历史）
         compactArchiveChars: 1200,
         memoryCfg: { longMaxChars: 4000 },
         // 每个模型阶段可单独覆盖。两种来源：
@@ -229,12 +229,13 @@ export function apply(ctx, config = {}) {
           '  融合 / 摘要不受影响，它们默认跟当前会话模型走。改完重启 dsh 生效。',
           'bootMaxChars = 总闸门，0 = 不限制（推荐）。注入多少由 memoryCfg 的三层容量自己决定。',
           'memoryCfg.longMaxChars = L3 视图容量（长期记忆能进上下文的字数）。',
-          'injectHot = 是否注入 L1「刚发生的」。默认 true：记忆块是追加在末尾的快照，',
-          '  前面历史的缓存不受影响（早先「会打掉缓存」的说法只在 section() 时代成立，已更正）。',
-          '  与 compactKeepTurns 配套：压成 0 时必须开 true，否则模型看不见上一句说了什么。',
-          'refreshMinMs = 记忆块变化后的最小刷新间隔（毫秒），默认 1800000（30 分钟）。',
+          '三层（L1/L2/L3）恒定注入，没有开关：想多要或少要就改 memoryCfg 里各自的容量。',
+          'refreshMinMs = L3 视图的刷新间隔（毫秒），默认 1800000（30 分钟）。',
+          '  这是全局唯一需要节流的地方：L3 排在注入块最前，它一变，后面 L2/L1 的缓存全断。',
+          '  L1/L2 不节流——写了就带上下一轮，追加在末尾，不影响前面的缓存。',
           'autoCompact = 每轮结束时把 dsh 自带历史压成一条占位（零 LLM），被压掉的内容先归档进记忆。',
-          'compactKeepTurns = 压完保留最近几轮原文。默认 1：上下文恒定 = 系统提示 + 记忆块 + 最近 1 轮。',
+          'compactKeepTurns = 0 表示完全取替 dsh 会话历史（L1 里已经有历史了）。',
+          '  想多留一点临时内容，把 L1 容量（memoryCfg.hotMaxChars）调大即可。',
           'preset = siliconflow 时，嵌入用 BAAI/bge-m3、重排用 BAAI/bge-reranker-v2-m3（都免费）；custom 则用 models 里填的。',
           'models[stage].source = session 表示这个阶段跟着当前对话用的模型走（不用额外 key）；api 则走下面填的地址/key。',
           'noThink = 是否关思考。chat（融合判关系）默认关，summary 默认不关。',
@@ -319,7 +320,14 @@ export function apply(ctx, config = {}) {
     ...models,
     embedSignature,
     // memoryCfg 允许 config.json 覆盖 v5 的底层参数（如 longMaxChars = L3 视图容量）
-    cfg: { ...MEM_DEFAULTS, ...(cfg.memoryCfg || {}), summarizeMode: 'deferred' },
+    cfg: {
+      ...MEM_DEFAULTS,
+      ...(cfg.memoryCfg || {}),
+      summarizeMode: 'deferred',
+      // 顶层的 refreshMinMs 现在只管 L3 视图（DL3 排序）的重算间隔。
+      // L1 / L2 不节流——它们每轮都在变，且追加在末尾，节流没有意义。
+      viewRefreshMs: Number(cfg.refreshMinMs) || MEM_DEFAULTS.viewRefreshMs,
+    },
   })
 
   // 启动补结算：关机期间该忘的、该沉的要补上。异步，不阻塞加载。
@@ -565,25 +573,21 @@ export function apply(ctx, config = {}) {
     })
   }
 
-  // ── 注入上下文：每轮实时生成，但带节流 ──
+  // ── 注入上下文：每轮现算，随写随带 ──
   //
-  // ★ 为什么要节流：L3 视图按 importance×heat 截取，而 heat 随时间衰减，
-  //   边界条目的分数会此消彼长，导致入选集合时不时变一条。文本一变，
-  //   快照就刷新一次、多一条 user 消息，前缀缓存也就断一次。
-  //   5 分钟内的变化先压住，返回上一次的文本 —— 记忆晚几分钟进上下文没人察觉，
-  //   但每轮多几千 token 是真金白银。
+  // ★ 2026-11-01 改：以前这里对整个记忆块做时间节流（L3+L2+L1 一起压 30 分钟），
+  //   那是错的——
+  //   ① L1 每轮都有新数据写入，压着不刷新，模型就看不到你刚说的话；
+  //   ② 快照是**追加**在末尾的，前面历史的缓存不受影响，没什么可省的。
+  //
+  //   真正要节流的是 L3 的排序（决定哪些 DL3 条目进 L3），它在注入块最前面，
+  //   一动后面全断。那个节流在 memory5 的 l3View 里做，间隔 = refreshMinMs。
+  //
+  //   这里只保留一条：内容没变就不重复追加，免得每轮多一条一模一样的 user 消息。
   let lastBlock = ''
-  let lastBlockAt = 0
   const getBlock = () => {
-    const fresh = mem.buildBlock(cfg.bootMaxChars, { includeHot: cfg.injectHot === true })
-    const now = Date.now()
-    const gap = now - lastBlockAt
-    // 首次（空→有）立刻生效；之后变化要等过节流窗口
-    if (!lastBlock || fresh === lastBlock || gap >= cfg.refreshMinMs) {
-      lastBlock = fresh
-      lastBlockAt = now
-      return fresh
-    }
+    const fresh = mem.buildBlock(cfg.bootMaxChars)
+    if (fresh !== lastBlock) lastBlock = fresh
     return lastBlock
   }
 

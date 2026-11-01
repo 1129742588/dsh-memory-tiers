@@ -79,6 +79,12 @@ export const DEFAULTS = {
   //   这个参数留着只是为了兼容旧配置，改成任何值都不影响行为。
   consolidateDays: 0,         // 已弃用（0 = 不按时间触发）
   longMaxChars: 2000,         // 长久层上限，超了往 DL3 沉
+
+  // ★ L3 视图（DL3 → L3 的排序）重算间隔，默认 30 分钟。
+  //   这是全局唯一需要节流的东西，原因见 l3View 的注释：
+  //   L3 在上下文里排最前，它一变，后面 L2 / L1 的前缀缓存全断；
+  //   而 L1 / L2 本来每轮都在变且排在末尾，节流它们没有意义。
+  viewRefreshMs: 30 * 60 * 1000,
   dl2MaxChars: 12000,         // DL2（重要原文库）上限，超了就压缩字数
   dl2CompressTarget: 400,     // 单条超过这么多字才值得压缩
   allowModelCompress: false,  // ★ 默认不许用模型压缩：实测一个字都减不掉，纯烧钱
@@ -2782,7 +2788,29 @@ export function createMemory5(o = {}) {
   // 好处：老摘要热度掉了，分数自动掉下去，**不用搬数据**就退出上下文。
   //       不需要"L3 满了挤出去"这种逻辑，也就不会出现"冷掉的摘要赖着不走"。
   // ============================================================
-  function l3View(now = tick()) {
+  // L3 是「视图」不是「层」：每次都从 DL3 现算，条目本身没有副本。
+  //
+  // ★ 这个排序是全局唯一需要节流的地方（2026-11-01 改）。
+  //   以前节流的是「整个记忆块」（L3+L2+L1 一起），那是错的：
+  //   ① L1 每轮都有新数据写入，压着不刷新 = 模型看不到刚说的话；
+  //   ② 快照是追加在末尾的，前面的历史缓存根本不受影响，没有可省的。
+  //
+  //   真正会打断缓存的只有 L3：它在注入块里排最前，L3 一变，
+  //   后面 L2 / L1 的整段前缀全部失效。而 heat 随时间连续衰减，
+  //   边界条目的分数此消彼长，入选集合时不时会变一条——必须压住。
+  //
+  //   所以：排序结果缓存 viewRefreshMs（默认 30 分钟），期间复用同一批入选条目。
+  //   L1 / L2 不缓存，每轮现算。
+  let l3Cache = null
+
+  function l3View(now = tick(), opts = {}) {
+    const refreshMs = Number(cfg.viewRefreshMs) || 0
+    // 容量变了要立刻重算：否则把 longMaxChars 调大要等一个周期才见效
+    const key = cfg.longMaxChars
+    if (!opts.force && l3Cache && l3Cache.key === key && refreshMs > 0 && now - l3Cache.at < refreshMs) {
+      return l3Cache.items
+    }
+
     const pool = byLayer(LAYER.DL_LONG).filter((it) => !it.supersededBy)
 
     const scored = pool.map((it) => ({
@@ -2799,6 +2827,7 @@ export function createMemory5(o = {}) {
       out.push(it)
       used += len
     }
+    l3Cache = { at: now, key, items: out }
     return out
   }
 
@@ -2811,9 +2840,9 @@ export function createMemory5(o = {}) {
    *   L3←longMaxChars、L2←consolidateMaxChars、L1←hotMaxChars。
    *   > 0 时才作为最后一道闸门截断（给不信任容量的调用方兜底）。
    * @param {{includeHot?: boolean}} [opts]
-   *   includeHot 默认 true（保持旧行为）。接上下文时建议传 false：
-   *   L1 就是当前会话的对话，历史里已经有了，重复注入只会让注入块每轮变化，
-   *   把系统提示词/快照的缓存全打掉。
+   * @param {{includeHot?: boolean}} [opts]
+   *   includeHot 恒为 true：三层都注入，没有开关（2026-11-01 移除该开关）。
+   *   要调的是各层容量，不是注不注入。参数留着只为兼容旧调用。
    */
   function buildBlock(budget = 0, opts = {}) {
     const includeHot = opts.includeHot !== false
