@@ -5,7 +5,8 @@
  * link 安装的插件 import 不到 @deepseek-ai/*，拿不到 dsh 的 schema 包（见 ARCHITECTURE 19.5）。
  * 走 webServer + 自己的 React 组件反而更可控——字段说明、分组、只读状态都能自己排版。
  */
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs'
+import { readFileSync, writeFileSync, existsSync, mkdirSync, readdirSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { isIP } from 'node:net'
 
@@ -25,6 +26,14 @@ const WRITABLE = {
   sweepEveryMs: 'number',
   // 'siliconflow' = 嵌入/重排用那两个免费模型；'custom' = 用 models 里自己填的
   preset: 'string',
+  // ★ 多写者标识：共用同一个数据目录时每个程序必须不同（决定写哪份 store-<writer>.json）
+  writer: 'string',
+}
+
+/** 数据目录：不写 config.json（它在目录里面，鸡生蛋），写固定位置的指针文件 */
+function pointerFile() {
+  const home = process.env.DSH_HOME || join(homedir(), '.dsh')
+  return join(home, 'memory-tiers.json')
 }
 
 /** 关思考：chat（融合判关系）默认 true，summary 默认 false */
@@ -141,10 +150,23 @@ export function installSettingsApi(ctx, opts) {
         ok: true,
         config: {
           ...file,
+          // dir 不在 config.json 里（它在数据目录里面，鸡生蛋），从指针文件回填给界面
+          dir: live.dir || dir,
+          writer: file.writer || 'default',
           memoryCfg: { ...(file.memoryCfg || {}) },
         },
         live: {
           dir,
+          // 多写者：我自己是谁、还有谁在往这个目录写（看目录里有哪些 store-*.json）
+          writer: live.writer || 'default',
+          peers: (() => {
+            try {
+              return readdirSync(dir)
+                .map((f) => f.match(/^store-([A-Za-z0-9_-]+)\.json$/)?.[1])
+                .filter(Boolean)
+            } catch { return [] }
+          })(),
+          pointerFile: pointerFile(),
           counts: stats?.count ?? null,
           chars: stats?.chars ?? null,        // 每层字数（设置页要写清楚"存了多少字"）
           vectors: stats?.vectors ?? null,
@@ -182,6 +204,19 @@ export function installSettingsApi(ctx, opts) {
     const next = { ...cur }
     const applied = []
     const ignored = []
+
+    // 数据目录单独处理：写指针文件，不写 config.json
+    if (typeof incoming.dir === 'string') {
+      const v = incoming.dir.trim()
+      if (v) {
+        try {
+          writeFileSync(pointerFile(), JSON.stringify({ dir: v }, null, 2), 'utf8')
+          applied.push('dir(指针文件)')
+        } catch {
+          ignored.push('dir')
+        }
+      }
+    }
 
     for (const [k, kind] of Object.entries(WRITABLE)) {
       if (!(k in incoming)) continue

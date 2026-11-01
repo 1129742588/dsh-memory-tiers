@@ -198,7 +198,11 @@ export function dayKey(ts) {
 
 let __seq = 0
 let __idn = 0
-const nextId = () => `m5_${(++__idn).toString(36)}_${Date.now().toString(36).slice(-4)}`
+// 尾部那 4 位随机是给「多进程共享一个库」用的：__idn 是进程内计数器，
+// 两个进程（dsh + astrbot）都从 1 开始，纯计数器必然撞 id。
+// 加了随机数后同毫秒同序号撞上的概率约 1/1.7e6，可忽略。
+const nextId = () =>
+  `m5_${(++__idn).toString(36)}_${Date.now().toString(36).slice(-4)}${Math.random().toString(36).slice(2, 6)}`
 
 export function makeItem({
   text,
@@ -487,7 +491,7 @@ export function decideConsolidateRoute(item, now = Date.now(), cfg = DEFAULTS) {
 //   audit.log                  每次写入/迁移/遗忘一行
 // ============================================================
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, readdirSync, renameSync } from 'node:fs'
+import { readFileSync, writeFileSync, mkdirSync, existsSync, unlinkSync, readdirSync, renameSync, statSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 
 // ★ 向量分片（2026-10-31）
@@ -504,8 +508,19 @@ import { join, dirname } from 'node:path'
 //   （写分片 + 旧文件改名 .bak，保留回退，下次不再读）。
 //   这条是给已在跑的 .big / 线上库用的，不要删。
 const VEC_SHARD_SIZE = 5000
-const VEC_SHARD_RE = /^vectors-part-(\d{4})\.json$/
+const VEC_SHARD_RE = /^vectors-part-(\d{4})\.json$/          // 旧版无前缀
 const vecShardName = (i) => `vectors-part-${String(i).padStart(4, '0')}.json`
+
+// ★ 多写者（2026-11-01）：每个写者只写自己那份文件，读的时候把所有人的合并起来看。
+//   这样两个进程同时跑也不需要锁——谁也不覆盖谁。
+//   writer 名字只留 [a-z0-9_-]，因为它会进文件名。
+const VEC_ANY_RE = /^vectors-(.+)-part-(\d{4})\.json$/
+const vecOwnRe = (w) => new RegExp(`^vectors-${w}-part-(\\d{4})\\.json$`)
+const vecOwnName = (w, i) => `vectors-${w}-part-${String(i).padStart(4, '0')}.json`
+const sanitizeWriter = (w) =>
+  String(w || '').trim().replace(/[^A-Za-z0-9_-]/g, '').slice(0, 32) || 'default'
+const STORE_RE = /^store-([A-Za-z0-9_-]+)\.json$/
+const storeOwnName = (w) => `store-${w}.json`
 
 export function createStore(dir, opts = {}) {
   // ★ 向量指纹：记录这批向量是哪个 embedding 模型生成的。
@@ -517,23 +532,91 @@ export function createStore(dir, opts = {}) {
   //
   //   指纹不符 → 隔离旧向量 + 从零重建，宁可暂时没有语义检索也不给错的结果。
   const signature = typeof opts.signature === 'string' ? opts.signature : null
+  const writer = sanitizeWriter(opts.writer)
   mkdirSync(dir, { recursive: true })
   mkdirSync(join(dir, 'archive'), { recursive: true })
   mkdirSync(join(dir, 'graveyard'), { recursive: true })
 
-  const storePath = join(dir, 'store.json')
-  const vecPath = join(dir, 'vectors.json')   // 旧版单文件：只读兼容 + 迁移用
-  const metaPath = join(dir, 'vectors.meta.json')
+  const storePath = join(dir, storeOwnName(writer))   // 自己的分片
+  const legacyStorePath = join(dir, 'store.json')     // 旧版单文件：只迁移一次
+  const vecPath = join(dir, 'vectors.json')           // 旧版单文件向量
+  const metaPath = join(dir, `vectors-${writer}.meta.json`)
+  const legacyMetaPath = join(dir, 'vectors.meta.json')
 
   let state = { version: 5, seq: 0, items: [] }
   let vectors = new Map()
 
-  if (existsSync(storePath)) {
+  const listDir = () => { try { return readdirSync(dir) } catch { return [] } }
+
+  function readShard(p) {
     try {
-      const raw = JSON.parse(readFileSync(storePath, 'utf8'))
-      if (raw && Array.isArray(raw.items)) state = raw
-    } catch { /* 坏了就当空库，不让它挡住启动 */ }
+      const raw = JSON.parse(readFileSync(p, 'utf8'))
+      return raw && Array.isArray(raw.items) ? raw : null
+    } catch { return null }   // 单个分片坏了跳过，不让别的写者连累自己
   }
+
+  /** 别人的分片：只读，标上 __foreign，写回时会被排除 */
+  function loadForeign() {
+    const out = []
+    for (const f of listDir()) {
+      const m = f.match(STORE_RE)
+      if (!m || m[1] === writer) continue
+      const raw = readShard(join(dir, f))
+      if (!raw) continue
+      for (const it of raw.items) { it.__foreign = true; out.push(it) }
+    }
+    return out
+  }
+
+  /**
+   * 把别人的最新内容合并进来（他们可能刚写了新东西）。
+   *
+   * ★ 为什么需要：对方的条目是**启动时和他每次落盘时**才读进来的，
+   *   不刷新的话 dsh 会一直看不见 astrbot 刚记的东西。
+   * ★ 为什么带 TTL：全量 re-read 别人的分片有磁盘开销，
+   *   检索/注入每次都刷太浪费；15 秒一次足够"感觉是实时的"。
+   */
+  // 别人的分片"指纹"：文件名 + 修改时间 + 大小。
+  // 只要没变就不重读——比定时刷新准（对方一写就能看见），也比每次都读便宜。
+  let foreignSig = ''
+  let gen = 0            // 条目集合换过一代就 +1，上层缓存（分层索引）据此失效
+  function foreignSignature() {
+    let sig = ''
+    try {
+      for (const f of readdirSync(dir)) {
+        const m = f.match(STORE_RE)
+        if (!m || m[1] === writer) continue
+        try {
+          const st = statSync(join(dir, f))
+          sig += `${f}:${st.mtimeMs}:${st.size};`
+        } catch { sig += `${f}:?;` }
+      }
+    } catch { /* 列不出目录就当没变 */ }
+    return sig
+  }
+  function refreshForeign() {
+    const own = state.items.filter((it) => !it.__foreign)
+    state.items = own.concat(loadForeign())
+    foreignSig = foreignSignature()
+    gen++
+  }
+  /** 别人的文件动过才重读。检索 / 注入 / 统计前调一下就行，代价是几次 stat */
+  function maybeRefreshForeign() {
+    const sig = foreignSignature()
+    if (sig === foreignSig) return false
+    refreshForeign()
+    return true
+  }
+  foreignSig = foreignSignature()
+
+  // 自己的数据：优先自己的分片；没有就认领旧版 store.json（只在还没有任何
+  // store-*.json 时认领一次，否则第二个写者会把同一份数据领走变成双份）。
+  let own = readShard(storePath)
+  if (!own && existsSync(legacyStorePath) && !listDir().some((f) => STORE_RE.test(f))) {
+    own = readShard(legacyStorePath)
+  }
+  if (own) state = own
+  state.items = (state.items || []).concat(loadForeign())
 
   function readVecMeta() {
     try { return JSON.parse(readFileSync(metaPath, 'utf8')) } catch { return null }
@@ -555,12 +638,13 @@ export function createStore(dir, opts = {}) {
   /** 指纹不符时把旧向量整体挪走（不删，留给用户回退/核对） */
   function quarantineVectors(reason) {
     const stamp = new Date().toISOString().replace(/[:.]/g, '-')
-    const bak = join(dir, `vectors.stale-${stamp}`)
+    const bak = join(dir, `vectors.stale-${writer}-${stamp}`)
     let moved = 0
     try {
       mkdirSync(bak, { recursive: true })
-      for (const f of readdirSync(dir)) {
-        if (!VEC_SHARD_RE.test(f) && f !== 'vectors.meta.json') continue
+      for (const f of listDir()) {
+        // 只隔离自己的：别人的向量我们没有资格动
+        if (!vecOwnRe(writer).test(f) && f !== `vectors-${writer}.meta.json`) continue
         try { renameSync(join(dir, f), join(bak, f)); moved++ } catch { /* 单个失败不阻塞 */ }
       }
     } catch { /* 建不了备份目录就原地不动，下面也不加载 */ }
@@ -568,11 +652,26 @@ export function createStore(dir, opts = {}) {
     return bak
   }
 
-  /** 读全部分片；没有任何分片返回 null（交给旧文件兼容逻辑） */
+  /** 读自己的分片；没有任何分片返回 null（交给旧文件兼容逻辑） */
   function readVecShards() {
-    let files
-    try { files = readdirSync(dir) } catch { return null }
-    const shards = files.filter((f) => VEC_SHARD_RE.test(f)).sort()
+    let files = listDir()
+    const re = vecOwnRe(writer)
+    let shards = files.filter((f) => re.test(f)).sort()
+    if (!shards.length) {
+      // 首次迁移：目录里只有旧的无前缀分片，且还没有别的写者 → 认领为自己的
+      const legacy = files.filter((f) => VEC_SHARD_RE.test(f))
+      const others = files.filter((f) => VEC_ANY_RE.test(f) && !re.test(f))
+      if (legacy.length && !others.length) {
+        for (const f of legacy) {
+          try { renameSync(join(dir, f), join(dir, vecOwnName(writer, Number(f.match(VEC_SHARD_RE)[1])))) } catch { /* 认领失败就跳过 */ }
+        }
+        if (!existsSync(metaPath) && existsSync(legacyMetaPath)) {
+          try { renameSync(legacyMetaPath, metaPath) } catch { /* 同上 */ }
+        }
+        files = listDir()
+        shards = files.filter((f) => re.test(f)).sort()
+      }
+    }
     if (!shards.length) return null
     const out = new Map()
     for (const f of shards) {
@@ -599,11 +698,12 @@ export function createStore(dir, opts = {}) {
       for (const [k, v] of entries.slice(i * VEC_SHARD_SIZE, (i + 1) * VEC_SHARD_SIZE)) {
         out[k] = Buffer.from(v.buffer, v.byteOffset, v.byteLength).toString('base64')
       }
-      writeFileSync(join(dir, vecShardName(i)), JSON.stringify(out), 'utf8')
+      writeFileSync(join(dir, vecOwnName(writer, i)), JSON.stringify(out), 'utf8')
     }
     try {
-      for (const f of readdirSync(dir)) {
-        const m = f.match(VEC_SHARD_RE)
+      const re = vecOwnRe(writer)
+      for (const f of listDir()) {
+        const m = f.match(re)
         if (m && Number(m[1]) >= shardCount) unlinkSync(join(dir, f))
       }
     } catch { /* 清不掉不影响正确性，下次再清 */ }
@@ -628,7 +728,7 @@ export function createStore(dir, opts = {}) {
       vectors = sharded
       if (!meta) writeVecMeta(sharded.size)   // 老库补写指纹
     }
-  } else if (!vectorsDisabled && existsSync(vecPath)) {
+  } else if (!vectorsDisabled && existsSync(vecPath)) {   // 旧版单文件，仅首次
     try {
       const raw = JSON.parse(readFileSync(vecPath, 'utf8'))
       for (const [k, v] of Object.entries(raw || {})) {
@@ -641,8 +741,24 @@ export function createStore(dir, opts = {}) {
     } catch { /* 同上 */ }
   }
 
+  /** 原子落盘：先写临时文件再改名。两个进程同时 save 不会互相撕坏文件 */
+  function atomicWrite(p, body) {
+    const tmp = `${p}.tmp-${process.pid}`
+    try {
+      writeFileSync(tmp, body, 'utf8')
+      renameSync(tmp, p)
+    } catch {
+      try { unlinkSync(tmp) } catch { /* 临时文件清不掉不影响 */ }
+      writeFileSync(p, body, 'utf8')   // 改名失败就退回直接写，别把数据丢了
+    }
+  }
+
   function save() {
-    writeFileSync(storePath, JSON.stringify(state, null, 1), 'utf8')
+    // 落盘前先看一眼别人有没有新东西，合并进内存视图
+    refreshForeign()
+    // 只写自己的条目：别人的数据在他们自己的分片里，我们没有资格替他们存
+    const mine = state.items.filter((it) => !it.__foreign)
+    atomicWrite(storePath, JSON.stringify({ ...state, items: mine }, null, 1))
     writeVecShards()
   }
 
@@ -673,9 +789,16 @@ export function createStore(dir, opts = {}) {
     get items() { return state.items },
     set items(v) { state.items = v },
     get vectors() { return vectors },
-    save, saveVectors, audit,
+    save, saveVectors, audit, refreshForeign, maybeRefreshForeign,
+    /** 条目集合的代数：变了说明别人的数据合并进来了，上层缓存要重算 */
+    get gen() { return gen },
     dumpVectors,
     dir,
+    writer,
+    /** 自己的条目（不含别人的） */
+    get ownItems() { return state.items.filter((it) => !it.__foreign) },
+    /** 是不是自己的条目——不是就不能改、不能删 */
+    isOwn: (it) => !it.__foreign,
   }
 }
 
@@ -757,7 +880,7 @@ export function createMemory5(o = {}) {
   const cfg = { ...DEFAULTS, ...(o.cfg || {}) }
   const dir = o.dir || '.memory5'
   const tick = o.now || (() => Date.now())
-  const store = createStore(dir, { signature: o.embedSignature })
+  const store = createStore(dir, { signature: o.embedSignature, writer: o.writer })
 
   // ============================================================
   // 模型调用统计
@@ -825,10 +948,16 @@ export function createMemory5(o = {}) {
   // 待摘要队列（summarizeMode === 'deferred' 时用）
   const summaryQueue = []
 
-  const byLayer = (layer) => store.items.filter((it) => it.layer === layer)
+  // ★ 默认只返回**自己的**条目：分流、遗忘、压缩、融合这些会改数据的操作，
+  //   只能动自己写的（别人的数据在别人的分片里，我们改了也存不回去）。
+  //   要看全库（检索、注入上下文、统计、列目录）就传 { all: true }。
+  const byLayer = (layer, opts) =>
+    store.items.filter((it) => it.layer === layer && ((opts && opts.all) || !it.__foreign))
   const chars = (list) => list.reduce((s, it) => s + String(it.text || '').length, 0)
   const find = (id) => store.items.find((it) => it.id === id)
   const removeItem = (id) => {
+    const it = store.items.find((x) => x.id === id)
+    if (it && it.__foreign) return false   // 别人的条目：删了也会被他的分片带回来
     store.items = store.items.filter((it) => it.id !== id)
     invalidateLayerIndex()   // 条目少了，桶要重建
   }
@@ -1022,13 +1151,15 @@ export function createMemory5(o = {}) {
   //   Map.get 是 O(1)，比重建索引便宜几个数量级。
   // ============================================================
   let _layerIndex = null
+  let _layerIndexGen = -1
 
   // 用 function 声明而不是箭头函数：让它们能提升，removeItem / moveTo
   // 这些在 createMemory5 体里更早定义的函数就能安全调用，不会有 TDZ 风险。
   function invalidateLayerIndex() { _layerIndex = null }
 
   function getLayerIndex() {
-    if (_layerIndex) return _layerIndex
+    // 别人的数据合并进来后，索引必须重建，否则会漏掉他们新写的条目
+    if (_layerIndex && _layerIndexGen === store.gen) return _layerIndex
     const m = new Map()
     for (const it of store.items) {
       let arr = m.get(it.layer)
@@ -1036,6 +1167,7 @@ export function createMemory5(o = {}) {
       arr.push(it)
     }
     _layerIndex = m
+    _layerIndexGen = store.gen
     return m
   }
 
@@ -2488,6 +2620,7 @@ export function createMemory5(o = {}) {
    * @returns 带 confidence / advice 的结果，advice 是给模型看的下一步建议
    */
   async function search(query, { depth = 'auto', ...opt } = {}) {
+    store.maybeRefreshForeign()      // 别人可能刚写了新东西，15 秒内刷一次
     const q = String(query || '').trim()
     const limit = opt.limit || 6
 
@@ -2811,7 +2944,8 @@ export function createMemory5(o = {}) {
       return l3Cache.items
     }
 
-    const pool = byLayer(LAYER.DL_LONG).filter((it) => !it.supersededBy)
+    // all：全库。别人沉淀的摘要也该出现在 L3 里，这才是共享的意义
+    const pool = byLayer(LAYER.DL_LONG, { all: true }).filter((it) => !it.supersededBy)
 
     const scored = pool.map((it) => ({
       it,
@@ -2845,12 +2979,13 @@ export function createMemory5(o = {}) {
    *   要调的是各层容量，不是注不注入。参数留着只为兼容旧调用。
    */
   function buildBlock(budget = 0, opts = {}) {
+    store.maybeRefreshForeign()      // 上下文里要带上别人刚记的东西
     const includeHot = opts.includeHot !== false
     // ★ L3 是视图：从 DL3 按 importance×热度 截取。
     //   截出来之后按 seq 升序排——新增加末尾，前面逐字节不变，前缀缓存能命中。
     const long = l3View().sort((a, b) => a.seq - b.seq)
-    const cons = byLayer(LAYER.CONSOLIDATE).sort((a, b) => a.seq - b.seq)
-    const hot = byLayer(LAYER.HOT).sort((a, b) => b.seq - a.seq)   // 最新的在前
+    const cons = byLayer(LAYER.CONSOLIDATE, { all: true }).sort((a, b) => a.seq - b.seq)
+    const hot = byLayer(LAYER.HOT, { all: true }).sort((a, b) => b.seq - a.seq)   // 最新的在前
 
     // 作废条不进上下文：新的那条已经在里面了，再放旧的只会让模型看到两条相反的指令。
     // 想查历史可以走 search（那里会改写成"（已作废）…"）。
@@ -2911,11 +3046,12 @@ export function createMemory5(o = {}) {
   // 观测 / 维护
   // ============================================================
   function stats() {
+    store.maybeRefreshForeign()
     const count = {}
     const charsBy = {}
     for (const l of Object.values(LAYER)) {
       // L3 是视图，按"当前能进上下文的条数"算，不是 DL3 的存储量
-      const list = l === LAYER.LONG ? l3View(tick()) : byLayer(l)
+      const list = l === LAYER.LONG ? l3View(tick()) : byLayer(l, { all: true })
       count[l] = list.length
       charsBy[l] = chars(list)
     }
@@ -2958,7 +3094,7 @@ export function createMemory5(o = {}) {
 
   function list(layer = null) {
     if (layer === LAYER.LONG) return l3View(tick())   // L3 是视图
-    return (layer ? byLayer(layer) : store.items).slice()
+    return (layer ? byLayer(layer, { all: true }) : store.items).slice()
   }
 
   /** 手动快进时间（测试用） */
@@ -2994,6 +3130,8 @@ export function createMemory5(o = {}) {
     flushSummaries,
     pendingSummaries,
     dumpVectors: (p) => store.dumpVectors(p),    // 合并导出向量快照（调试/分析用）
+    /** 底层 store：测试和多写者调试用 */
+    _store: store,
     fuse: consolidateFusion,                    // 手动跑一次全量融合
     fuseDL3: fuseIntoDL3,                       // 摘要入 DL3 时的融合（判重的新位置）
     _seed: (item, vec) => {                                     // 直接注入（测试用）

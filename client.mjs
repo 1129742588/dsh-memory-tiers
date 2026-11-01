@@ -98,6 +98,26 @@ window.__ModuleLoader__.load({
     // ── 字段定义：改这里就能增减配置项（服务端白名单见 settings.mjs 的 WRITABLE） ──
     const FIELDS = [
       {
+        group: '数据共享（多个程序共用一个库）',
+        path: ['dir'],
+        label: '数据目录',
+        type: 'text',
+        wide: true,
+        hint: '记忆存在哪。改成 dsh 和 astrbot 都能访问的路径就能共享同一份记忆。'
+          + '它存在固定位置的指针文件里（不在 config.json 里——config.json 就在数据目录里面，'
+          + '得先知道目录才能读它）。换目录要把旧目录里的文件一起搬过去。改完需重启。',
+      },
+      {
+        group: '数据共享（多个程序共用一个库）',
+        path: ['writer'],
+        label: '写者标识',
+        type: 'text',
+        wide: true,
+        hint: '共用同一个目录时，**每个程序必须填得不一样**（如 dsh / astrbot）。'
+          + '它决定这个程序写哪份文件（store-<写者>.json）。填成一样的两个程序会互相覆盖。'
+          + '只读字母、数字、下划线和短横线。改完需重启。',
+      },
+      {
         group: '嵌入与重排',
         path: ['apiKey'],
         label: 'API Key',

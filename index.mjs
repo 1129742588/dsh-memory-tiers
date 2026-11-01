@@ -30,6 +30,9 @@ export const inject = ['tools']
 
 const PLUGIN_DEFAULTS = {
   dir: '',
+  // ★ 多写者标识：几个程序共用同一个数据目录时，每个必须不一样。
+  //   它决定这个进程写哪份文件（store-<writer>.json）。同名 = 互相覆盖。
+  writer: 'default',
   // 'siliconflow' = 嵌入/重排用硅基流动那两个免费的（bge-m3 / bge-reranker-v2-m3）
   // 'custom'      = 用 models 里自己填的来源
   preset: 'siliconflow',
@@ -72,7 +75,26 @@ function expandHome(p) {
   return s
 }
 
+/** 指针文件：{ "dir": "D:/shared/memory" }
+ *
+ * 为什么需要它：config.json 在**数据目录里面**，要先知道目录才能读它——
+ * 所以"数据目录在哪"这件事本身不能写在 config.json 里（鸡生蛋）。
+ * 放一个固定位置的指针文件，设置页就能改目录了。 */
+function pointerFile() {
+  const home = process.env.DSH_HOME || join(homedir(), '.dsh')
+  return join(home, 'memory-tiers.json')
+}
+
+function readPointerDir() {
+  try {
+    const raw = JSON.parse(readFileSync(pointerFile(), 'utf8'))
+    return expandHome(raw && raw.dir)
+  } catch { return '' }
+}
+
 function defaultDir() {
+  const fromPointer = readPointerDir()
+  if (fromPointer) return fromPointer
   const fromEnv = expandHome(process.env.MEMORY_TIERS_DIR)
   if (fromEnv) return fromEnv
   const home = process.env.DSH_HOME || join(homedir(), '.dsh')
@@ -201,6 +223,10 @@ export function apply(ctx, config = {}) {
       writeFileSync(p, JSON.stringify({
         // preset: 'siliconflow' = 嵌入/重排用硅基流动那两个免费模型；'custom' = 自己填下面的 models
         preset: 'siliconflow',
+        // ★ 写者标识：多个程序共用这个目录时，每个必须改成不一样的
+        //   （dsh / astrbot / ...）。它决定这个程序写 store-<writer>.json 里的哪一份。
+        //   填成一样的两个程序会互相覆盖对方的写入。
+        writer: 'default',
         apiKey: '',
         apiBase: 'https://api.siliconflow.cn/v1',
         bootMaxChars: 0,               // 0 = 不限制，注入量由 L1/L2/L3 各自容量决定
@@ -239,6 +265,10 @@ export function apply(ctx, config = {}) {
           'preset = siliconflow 时，嵌入用 BAAI/bge-m3、重排用 BAAI/bge-reranker-v2-m3（都免费）；custom 则用 models 里填的。',
           'models[stage].source = session 表示这个阶段跟着当前对话用的模型走（不用额外 key）；api 则走下面填的地址/key。',
           'noThink = 是否关思考。chat（融合判关系）默认关，summary 默认不关。',
+          'writer = 写者标识。多个程序共用本目录时每个必须不同：各写各的 store-<writer>.json，',
+          '  读的时候合并。同名会互相覆盖。改完重启。',
+          'dir = 数据目录本身。它**不在这个文件里**（本文件就在数据目录里面，鸡生蛋），',
+          '  要改就改 ~/.dsh/memory-tiers.json 里的 {\"dir\":\"...\"}，或设环境变量 MEMORY_TIERS_DIR。',
         ],
       }, null, 2), 'utf8')
     }
@@ -317,6 +347,7 @@ export function apply(ctx, config = {}) {
 
   const mem = createMemory5({
     dir,
+    writer: cfg.writer,
     ...models,
     embedSignature,
     // memoryCfg 允许 config.json 覆盖 v5 的底层参数（如 longMaxChars = L3 视图容量）
