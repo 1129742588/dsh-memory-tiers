@@ -93,7 +93,11 @@ export async function compactSurface(session, mem, opts = {}) {
   }
 
   // 选区 = [first, keepStart)，keepStart 是「保留的第一轮」的 user 位置
-  const keepStart = userIdx[userIdx.length - keepTurns]
+  // ★ keepTurns === 0 是**受支持的显式选项**：整段历史全压成占位，dsh 侧一条原文不留。
+  //   以前靠 `userIdx[length - 0] === undefined` + `slice(first, undefined)` 恰好取到末尾
+  //   才"能用"，纯属巧合；这里写死，免得以后重构踩空。
+  //   ⚠️ 用 0 时必须同时开 injectHot（注入 L1），否则模型完全看不见刚才聊了什么。
+  const keepStart = keepTurns === 0 ? nodes.length : userIdx[userIdx.length - keepTurns]
   if (keepStart <= first) {
     return { compacted: false, removed: 0, archived: 0, reason: 'nothing-to-compact' }
   }

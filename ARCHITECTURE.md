@@ -834,10 +834,24 @@ dsh 有两套注入接口，语义完全不同：
 
 系统提示词因此变成逐字节不变 → 首轮之后全量命中缓存。
 
-**② L1 不再注入（`injectHot: false`）**
+**② L1 默认不注入（`injectHot: false`）—— 但这条理由后来被更正了**
 
-L1 存的是当前会话的对话原文，模型在历史里已经看过。把它再塞进注入块，
-唯一效果就是让注入块每轮都变、缓存每轮都断。跨会话恢复靠 L2/L3（沉淀过的）+ `memory_search`（按需检索）。
+> **⚠️ 2026-11-01 更正**：这里原先写的是「L1 每轮都变 → 注入块每轮变化 → **打掉缓存**」。
+> 那个结论只在 `section()` 时代成立。改用 `context()` 之后，记忆块是**追加**的 user 快照，
+> 位置在末尾，**前面历史缓存完全不受影响**。用户当场指出了这点，是对的。
+>
+> 真实成本只剩下「每轮多追加一条快照」，而 L1 通常只有几百到一千多字 —— 很小。
+> 所以 `injectHot` 该不该开，取决于下面的**配套关系**，不是缓存问题。
+
+`injectHot` 和 `compactKeepTurns` 必须配套：
+
+| 组合 | 模型能看到最近对话吗 | 说明 |
+|---|---|---|
+| `keepTurns=1` + `injectHot=false` | 能（靠 dsh 历史） | 默认。快照稳定、不重复付费；代价是历史留 1 轮原文 |
+| **`keepTurns=0` + `injectHot=true`** | 能（**只能靠 L1 快照**） | 彻底接管：dsh 历史一条不留，最近原话由 L1 提供 |
+| `keepTurns=0` + `injectHot=false` | **不能，完全失忆** | 禁用组合 |
+
+跨会话恢复始终靠 L2/L3（沉淀过的）+ `memory_search`（按需检索）。
 
 **③ 节流（`refreshMinMs`，默认 5 分钟）**
 
@@ -1482,4 +1496,45 @@ POST → HTTP 200, applied: ["apiKey","injectHot","memoryCfg.hotMaxChars","memor
 客户端: 模块加载 → 导出 apply/inject/MemoryTiersSection/FIELDS
         12 个字段 / 5 个分组
         slots.register({name:'settings.section', id:'memory-tiers', order:7, label:'记忆'})
+```
+
+### 21:00 补充：`compactKeepTurns: 0` 是受支持的显式选项（2026-11-01）
+
+用户要的是「dsh 历史一条不留，全部交给记忆」。实测**能做**：
+
+```
+第 1 轮压缩: removed=2 | surface 剩 2 条
+第 2 轮压缩: removed=3 | surface 剩 2 条
+第 3 轮压缩: removed=3 | surface 剩 2 条
+第 4 轮压缩: removed=3 | surface 剩 2 条
+
+最终 surface：
+  system/message: sys
+  user/message: （此前 1 轮对话已归档到长期记忆，需要细节可以让我检索）
+```
+
+聊多少轮，dsh 侧都只剩 **system + 一条占位**。
+
+**以前这段是靠巧合工作的**：`userIdx[length - 0]` 得到 `undefined`，`slice(first, undefined)`
+恰好等于「取到末尾」。虽然结果对，但纯属运气——已改成显式分支：
+
+```js
+const keepStart = keepTurns === 0 ? nodes.length : userIdx[userIdx.length - keepTurns]
+```
+
+**必须同时开 `injectHot: true`**，否则模型完全看不见上一句问了什么（见第 16 节的配套表）。
+
+注入块对照（真实库）：
+
+| 配置 | 注入块 | 构成 |
+|---|---|---|
+| `injectHot: false` | 4625 字 ≈ 3083 token | L3 4150 + L2 458 |
+| `injectHot: true` | 6088 字 ≈ 4059 token | L3 4150 + L2 458 + L1 1455 |
+
+每轮多约 1000 token（追加新快照，全价）——相对于「dsh 历史归零」这点代价可以接受。
+
+配置改动落在 `~/.dsh/storages/memory-v5/config.json`：
+
+```json
+{ "injectHot": true, "compactKeepTurns": 0 }
 ```
