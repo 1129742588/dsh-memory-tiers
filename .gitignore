@@ -32,3 +32,4 @@ Thumbs.db
 .test-share*/
 .sim-real/
 sim-real-report.txt
+.bench-scale/

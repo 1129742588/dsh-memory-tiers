@@ -983,6 +983,13 @@ export function createMemory6(o = {}) {
   function dl3Version() {
     try { const st = statSync(paths.DL3); return `${st.mtimeMs}:${st.size}` } catch { return '0:0' }
   }
+  /** DL3 文件多大（只用 stat，不解析）。注入判断"现算值不值得"时用 */
+  function dl3Bytes() {
+    try { return statSync(paths.DL3).size } catch { return 0 }
+  }
+  // 快照过期时现算的上限：小库（默认 1.5MB ≈ 三五千条摘要）现算只要几毫秒，
+  // 大库读一次要几秒——注入是每轮都跑的，宁可看旧快照，等整理者下一轮刷新。
+  const L3_INLINE_MAX = 1.5 * 1024 * 1024
 
   /** 从 DL3 按 importance×heat 截前 N 条（纯计算，不写盘） */
   function computeL3(db = null, now = tick()) {
@@ -1018,11 +1025,21 @@ export function createMemory6(o = {}) {
   function readL3Snapshot() {
     try {
       const snap = JSON.parse(readFileSync(paths.L3, 'utf8'))
-      if (snap && typeof snap.dl3v === 'string' && snap.dl3v === dl3Version()) {
-        return Array.isArray(snap.items) ? snap.items : []
-      }
-      return null
+      const items = Array.isArray(snap?.items) ? snap.items : []
+      if (snap && typeof snap.dl3v === 'string' && snap.dl3v === dl3Version()) return items
+      // 快照过期：小库返回 null（让调用方现算，保证"对方刚写下一轮就能看见"）；
+      // 大库直接给旧快照——读一次几十万条 DL3 要一两秒，注入扛不住。
+      if (dl3Bytes() <= L3_INLINE_MAX) return null
+      return items
     } catch { return null }
+  }
+
+  /** 快照是否落后于 DL3（整理者据此决定要不要重写，不受上面的"大库不现算"影响） */
+  function l3SnapshotStale() {
+    try {
+      const snap = JSON.parse(readFileSync(paths.L3, 'utf8'))
+      return snap?.dl3v !== dl3Version()
+    } catch { return true }
   }
 
   // ============================================================
@@ -1078,7 +1095,7 @@ export function createMemory6(o = {}) {
       // L3 快照：内容变了 / 快照过期 / 到了刷新间隔 才重写
       // （每 5 分钟无条件重排会打断前缀缓存，所以平时不动它）
       const l3Every = Number(cfg.viewRefreshMs) || 0
-      const needL3 = l3Dirty || !l3Every || (tick() - lastL3At >= l3Every) || readL3Snapshot() === null
+      const needL3 = l3Dirty || !l3Every || (tick() - lastL3At >= l3Every) || l3SnapshotStale()
       const l3 = needL3
         ? refreshL3(db)
         : (() => { try { return readLayer('L3').length } catch { return 0 } })()
