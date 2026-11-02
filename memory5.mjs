@@ -3111,6 +3111,8 @@ export function createMemory5(o = {}) {
   function pin(id, v = true) {
     const it = find(id)
     if (!it) return { ok: false, error: '找不到' }
+    // 别人的条目改了也存不回去（save 只写自己的分片），直接拒绝，别假装成功。
+    if (!store.isOwn(it)) return { ok: false, error: '别人的条目，不能钉住' }
     it.pinned = v
     store.save()
     return { ok: true, id, pinned: v }
@@ -3119,6 +3121,9 @@ export function createMemory5(o = {}) {
   function forgetById(id) {
     const it = find(id)
     if (!it) return { ok: false, error: '找不到' }
+    // 别人的条目：删不掉条目本身，但 forget() 会写台账、删归档——
+    // 等于"没删掉还删了对方的正文"。这里必须拦。
+    if (!store.isOwn(it)) return { ok: false, error: '别人的条目，不能删' }
     const ok = forget(it, '手动删除', tick())
     store.save()
     return { ok, id }

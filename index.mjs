@@ -20,6 +20,7 @@ import { homedir } from 'node:os'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { createMemory5, LAYER, DEFAULTS as MEM_DEFAULTS } from './memory5.mjs'
+import { createMemory6, DEFAULTS6 as MEM6_DEFAULTS } from './memory6.mjs'
 import { createSilicon, keyFromAstrbot } from './silicon.mjs'
 import { compactSurface } from './compaction.mjs'
 import { installSettingsApi } from './settings.mjs'
@@ -30,8 +31,11 @@ export const inject = ['tools']
 
 const PLUGIN_DEFAULTS = {
   dir: '',
+  // ★ 布局：'split' = 六文件（memory6，默认）；'legacy' = 老的单文件分片（memory5，回退用）
+  layout: 'split',
   // ★ 多写者标识：几个程序共用同一个数据目录时，每个必须不一样。
-  //   它决定这个进程写哪份文件（store-<writer>.json）。同名 = 互相覆盖。
+  //   split 布局下它决定 L1.tmp/<writer>.jsonl 和 signals/<writer>.jsonl 用哪个名字。
+  //   同名 = 互相往同一份 temp 里写（不会丢，但分不清是谁）。
   writer: 'default',
   // 'siliconflow' = 嵌入/重排用硅基流动那两个免费的（bge-m3 / bge-reranker-v2-m3）
   // 'custom'      = 用 models 里自己填的来源
@@ -45,7 +49,12 @@ const PLUGIN_DEFAULTS = {
   budgetTokens: 0,
   autoCapture: true,          // 自动订阅 session/event 写入 L1
   userCaptureChars: 2000,     // 单条用户消息最多记多少字
-  toolCaptureChars: 500,      // 工具输出截断（bash 一次能吐几万字，L1 才 1500 字）
+  toolCaptureChars: 500,      // 工具输出截断（bash 一次能吐几万字，L1 才 3000 字）
+  // 一轮会话里 assistant 的正文：拼起来再截断（不是每条消息截）。L1 要靠它当"最近历史"。
+  botCaptureChars: 400,
+  // split 布局：一段会话结束后，隔这么久没新消息才允许整理（避免聊到一半被摘要腰斩）
+  quietMs: 10 * 60 * 1000,
+  organizeEveryMs: 5 * 60 * 1000,   // 整理触发：端结束 + 这个定时器补漏
   // L1/L2/L3 恒定注入，没有开关——三层就是上下文的全部「记忆」，可调的是各自容量。
   refreshMinMs: 30 * 60 * 1000, // L3 视图（DL3 按热度×档位排序）的重算间隔。
   //   L1/L2 不节流，每轮现算并追加在末尾；只有 L3 排在注入块最前，它一动后面缓存全断。
@@ -223,9 +232,11 @@ export function apply(ctx, config = {}) {
       writeFileSync(p, JSON.stringify({
         // preset: 'siliconflow' = 嵌入/重排用硅基流动那两个免费模型；'custom' = 自己填下面的 models
         preset: 'siliconflow',
+        // ★ 布局：split = 六文件（L1/L2/L3/DL1/DL2/DL3）；legacy = 老的单文件分片（回退用）
+        layout: 'split',
         // ★ 写者标识：多个程序共用这个目录时，每个必须改成不一样的
-        //   （dsh / astrbot / ...）。它决定这个程序写 store-<writer>.json 里的哪一份。
-        //   填成一样的两个程序会互相覆盖对方的写入。
+        //   （dsh / astrbot / ...）。split 布局下它决定写 L1.tmp/<writer>.jsonl 里的哪一份。
+        //   填成一样的两个程序会往同一个 temp 里写（不丢，但分不清是谁）。
         writer: 'default',
         apiKey: '',
         apiBase: 'https://api.siliconflow.cn/v1',
@@ -233,12 +244,15 @@ export function apply(ctx, config = {}) {
         autoCapture: true,
         userCaptureChars: 2000,
         toolCaptureChars: 500,
+        botCaptureChars: 400,          // 一轮回复拼起来后截断（L1 要当最近历史用）
+        quietMs: 600000,               // 安静 10 分钟才允许整理 L1（别腰斩正在聊的对话）
+        organizeEveryMs: 300000,       // 整理定时器：5 分钟补一轮
         budgetTokens: 0,
-        refreshMinMs: 1800000,         // L3 视图刷新间隔，见 _说明
+        refreshMinMs: 1800000,         // L3 快照刷新间隔，见 _说明
         autoCompact: true,
         compactKeepTurns: 0,           // 0 = dsh 历史一条不留，全交给记忆（L1 就是历史）
         compactArchiveChars: 1200,
-        memoryCfg: { longMaxChars: 4000 },
+        memoryCfg: { longMaxChars: 4000, hotMaxChars: 3000 },
         // 每个模型阶段可单独覆盖。两种来源：
         //   source: 'session' —— 走 dsh 当前会话模型（对话用 flash 就 flash，不用额外 key）
         //   { base, apiKey, model } —— 走外部 provider
@@ -265,8 +279,10 @@ export function apply(ctx, config = {}) {
           'preset = siliconflow 时，嵌入用 BAAI/bge-m3、重排用 BAAI/bge-reranker-v2-m3（都免费）；custom 则用 models 里填的。',
           'models[stage].source = session 表示这个阶段跟着当前对话用的模型走（不用额外 key）；api 则走下面填的地址/key。',
           'noThink = 是否关思考。chat（融合判关系）默认关，summary 默认不关。',
-          'writer = 写者标识。多个程序共用本目录时每个必须不同：各写各的 store-<writer>.json，',
-          '  读的时候合并。同名会互相覆盖。改完重启。',
+          'writer = 写者标识。多个程序共用本目录时每个必须不同：split 布局下各写 L1.tmp/<writer>.jsonl，',
+          '  读的时候合起来。同名会分不清是谁。改完重启。',
+          'layout = split（六文件，默认）/ legacy（老的单文件分片，回退用）。',
+          'botCaptureChars = 一轮回复拼起来后截多少字；L1 容量（memoryCfg.hotMaxChars，默认 3000）达到就整理。',
           'dir = 数据目录本身。它**不在这个文件里**（本文件就在数据目录里面，鸡生蛋），',
           '  要改就改 ~/.dsh/memory-tiers.json 里的 {\"dir\":\"...\"}，或设环境变量 MEMORY_TIERS_DIR。',
         ],
@@ -332,7 +348,7 @@ export function apply(ctx, config = {}) {
         judgeRelation: (a, b) => silicon.relation(a, b),
         // ★ 参数顺序要包装：memory5 调 (lines, channel, folks)，silicon 是 (texts, hint, channel, people)
         summarize: (lines, channel, folks) => silicon.summarize(lines, '', channel, folks),
-        summarizeWithSources: (lines, ch, folks) => silicon.summarizeWithSources(lines, ch, folks),
+        summarizeWithSources: (lines, ch, folks, hint) => silicon.summarizeWithSources(lines, ch, folks, hint),
         rerank: (q, docs) => silicon.rerank(q, docs),
       }
     // 没有模型就什么都不给：不装假向量。memory5 会自动退到关键词打分
@@ -345,26 +361,51 @@ export function apply(ctx, config = {}) {
     ? `api:${silicon.resolveStage('embed').model}`
     : 'none'
 
-  const mem = createMemory5({
-    dir,
-    writer: cfg.writer,
-    ...models,
-    embedSignature,
-    // memoryCfg 允许 config.json 覆盖 v5 的底层参数（如 longMaxChars = L3 视图容量）
-    cfg: {
-      ...MEM_DEFAULTS,
-      ...(cfg.memoryCfg || {}),
-      summarizeMode: 'deferred',
-      // 顶层的 refreshMinMs 现在只管 L3 视图（DL3 排序）的重算间隔。
-      // L1 / L2 不节流——它们每轮都在变，且追加在末尾，节流没有意义。
-      viewRefreshMs: Number(cfg.refreshMinMs) || MEM_DEFAULTS.viewRefreshMs,
-    },
-  })
+  // writer 从进程侧注入（环境变量优先），不再只信共享 config.json——
+  // 两个程序读同一份 config 会拿到同一个 writer，等于往同一个 temp 里写。
+  const writer = String(process.env.MEMORY_WRITER || cfg.writer || 'default')
+  const layout = cfg.layout === 'legacy' ? 'legacy' : 'split'
+  log.info?.('[memory-tiers] 布局 %s · writer=%s · 嵌入 %s', layout, writer, embedSignature)
 
-  // 启动补结算：关机期间该忘的、该沉的要补上。异步，不阻塞加载。
-  Promise.resolve()
-    .then(() => mem.sweep())
-    .catch((err) => log.warn?.('[memory-tiers] 启动结算失败：%s', err?.message ?? err))
+  const mem = layout === 'legacy'
+    ? createMemory5({
+        dir,
+        writer,
+        ...models,
+        embedSignature,
+        // memoryCfg 允许 config.json 覆盖 v5 的底层参数（如 longMaxChars = L3 视图容量）
+        cfg: {
+          ...MEM_DEFAULTS,
+          ...(cfg.memoryCfg || {}),
+          summarizeMode: 'deferred',
+          viewRefreshMs: Number(cfg.refreshMinMs) || MEM_DEFAULTS.viewRefreshMs,
+        },
+      })
+    : createMemory6({
+        dir,
+        writer,
+        ...models,
+        embedSignature,
+        cfg: {
+          ...MEM6_DEFAULTS,
+          ...(cfg.memoryCfg || {}),
+          viewRefreshMs: Number(cfg.refreshMinMs) || MEM6_DEFAULTS.viewRefreshMs,
+          quietMs: Number.isFinite(Number(cfg.quietMs)) ? Number(cfg.quietMs) : MEM6_DEFAULTS.quietMs,
+          organizeEveryMs: Number(cfg.organizeEveryMs) || MEM6_DEFAULTS.organizeEveryMs,
+          botCaptureChars: Number(cfg.botCaptureChars) || MEM6_DEFAULTS.botCaptureChars,
+          toolCaptureChars: Number(cfg.toolCaptureChars) || MEM6_DEFAULTS.toolCaptureChars,
+        },
+      })
+
+  // split：内部自带"端结束 + 5 分钟定时器"；legacy：保持原来的启动结算。
+  const splitLayout = typeof mem.writeTurn === 'function'
+  if (splitLayout) {
+    mem.start()
+  } else {
+    Promise.resolve()
+      .then(() => mem.sweep())
+      .catch((err) => log.warn?.('[memory-tiers] 启动结算失败：%s', err?.message ?? err))
+  }
 
   /** 统一注册工具，单个失败不影响其他 */
   let toolCount = 0
@@ -451,7 +492,7 @@ export function apply(ctx, config = {}) {
       const ids = Array.isArray(args.ids) ? args.ids : (args.ids ? [args.ids] : [])
       if (!ids.length) return '没有提供 id'
       const n = mem.attend(ids)
-      return `已确认 ${n} 条相关（热度 +1）`
+      return splitLayout ? `已提交 ${n} 条关注（下次整理生效）` : `已确认 ${n} 条相关（热度 +1）`
     },
   })
 
@@ -467,6 +508,7 @@ export function apply(ctx, config = {}) {
     async execute(args = {}) {
       if (!args.id) return '删除失败：id 不能为空'
       const r = mem.forget(String(args.id))
+      if (r.queued) return `已提交删除 ${args.id}（下次整理生效）`
       return r.ok ? `已删除 ${args.id}` : `未找到 ${args.id}`
     },
   })
@@ -479,7 +521,7 @@ export function apply(ctx, config = {}) {
     async execute() {
       const s = mem.stats()
       const layers = Object.entries(s.count).map(([k, v]) => `${k}=${v}`).join(' ')
-      const pending = mem.pendingSummaries()
+      const pending = splitLayout ? (s.temp ?? 0) : mem.pendingSummaries()
       const calls = Object.entries(s.calls || {})
         .filter(([, v]) => v && v.rounds)
         .map(([k, v]) => `${k}:${v.rounds}`)
@@ -487,7 +529,8 @@ export function apply(ctx, config = {}) {
       return [
         `总条数 ${s.total} · 向量 ${s.vectors}`,
         `分层 ${layers}`,
-        `待摘要 ${pending} 条 · 调用 ${calls || '（无）'}`,
+        `${splitLayout ? '待整理' : '待摘要'} ${pending} 条 · 调用 ${calls || '（无）'}`,
+        `布局 ${layout} · 整理 ${s.lock ? '进行中/被占用' : '空闲'}`,
         `数据目录 ${dir}`,
       ].join('\n')
     },
@@ -496,10 +539,10 @@ export function apply(ctx, config = {}) {
   // ── 自动捕获：session/event → 按 turn 聚合写入 L1 ──
   if (cfg.autoCapture !== false && typeof ctx.on === 'function') {
     ctx.effect(() => {
-      const bufs = new Map()   // sessionId -> { user: [], tools: Map }
+      const bufs = new Map()   // sessionId -> { user: [], bot: [], tools: Map }
 
       const bufOf = (sid) => {
-        if (!bufs.has(sid)) bufs.set(sid, { user: [], tools: new Map() })
+        if (!bufs.has(sid)) bufs.set(sid, { user: [], bot: [], tools: new Map() })
         return bufs.get(sid)
       }
 
@@ -516,6 +559,14 @@ export function apply(ctx, config = {}) {
             const t = takeText(d.content)
             if (t) buf.user.push(t.slice(0, cfg.userCaptureChars))
           }
+          return
+        }
+
+        if (event.type === 'assistant/message') {
+          // L1 要记完整的一轮（问 + 答）。这里只收正文，reasoning/工具块不收。
+          // 一轮里可能有几条（工具循环），先全收，turn/end 时拼起来再截断。
+          const t = takeText(d.content ?? d.message?.content)
+          if (t) buf.bot.push(t)
           return
         }
 
@@ -540,7 +591,14 @@ export function apply(ctx, config = {}) {
 
         if (event.type === 'turn/end') {
           const rows = []
-          for (const t of buf.user) rows.push({ text: t, speaker: 'user', channel: 'dialog' })
+          // 同一个 turnId 标这一轮的所有行：溢出时按整轮取，问题和回答不会被拆开。
+          const turnId = `${writer}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+          for (const t of buf.user) rows.push({ text: t, speaker: 'user', channel: 'dialog', turnId })
+          if (buf.bot.length) {
+            const botText = buf.bot.join('\n').trim()
+            // ★ 截的是"整轮"的回复，不是每条消息——工具循环里可能有好几条 assistant 正文。
+            if (botText) rows.push({ text: botText.slice(0, cfg.botCaptureChars), speaker: 'bot', channel: 'dialog', turnId })
+          }
           for (const c of buf.tools.values()) {
             // ★ 没配到 result 的也要记：被中断/超时的调用同样是「做过的事」，
             //   漏掉它们会让"记录确确实实进了 L1"这个保证出现缺口。
@@ -550,20 +608,23 @@ export function apply(ctx, config = {}) {
               text: `运行 ${c.name}「${c.args.slice(0, 120)}」→ ${head}：${out}`,
               speaker: 'bot',
               channel: 'action',
+              turnId,
             })
           }
-          const stat = { user: buf.user.length, tool: buf.tools.size, rows: rows.length }
+          const stat = { user: buf.user.length, bot: buf.bot.length, tool: buf.tools.size, rows: rows.length }
           bufs.delete(sid)
 
           // ★ 顺序很重要：先归档进记忆，再压缩历史。
           //   压缩函数内部也会自己归档一次（它要保证「写成功才丢」），
           //   两者不冲突：这里记的是本轮原始消息，那里记的是被压掉的整段对话。
-          const doCompact = async () => {
+          const doCompact = async ({ archive = true } = {}) => {
             if (cfg.autoCompact === false || !session) return
             try {
               const cr = await compactSurface(session, mem, {
                 keepTurns: cfg.compactKeepTurns,
                 archiveChars: cfg.compactArchiveChars,
+                // rows 已经把这轮写进 L1 了，这里就别再归档一遍（会存两份）
+                archive,
                 log,
               })
               if (cr.compacted) {
@@ -578,23 +639,32 @@ export function apply(ctx, config = {}) {
 
           if (rows.length) {
             Promise.resolve()
-              .then(() => mem.writeMany(rows))
+              .then(() => (typeof mem.writeTurn === 'function' ? mem.writeTurn(rows) : mem.writeMany(rows)))
               .then((res) => {
                 // ★ 审计：这是 K1 那类 bug 唯一的照妖镜。
                 //   写入条数和实际进 L1 的条数都要记，光看 rows.length 看不出来。
                 const n = mem.stats?.().count?.L1 ?? '?'
-                log.info?.('[memory-tiers] turn 归档 user=%d tool=%d 写入=%d L1=%s',
-                  stat.user, stat.tool, rows.length, n)
-                appendCaptureLog(dir, `turn 归档 user=${stat.user} tool=${stat.tool} ` +
-                  `rows=${rows.length} written=${Array.isArray(res) ? res.length : '?'} L1=${n}`)
-                return doCompact()
+                const written = Array.isArray(res) ? res.length : (res?.ids?.length ?? '?')
+                log.info?.('[memory-tiers] turn 归档 user=%d bot=%d tool=%d 写入=%d L1=%s',
+                  stat.user, stat.bot, stat.tool, rows.length, n)
+                appendCaptureLog(dir, `turn 归档 user=${stat.user} bot=${stat.bot} tool=${stat.tool} ` +
+                  `rows=${rows.length} written=${written} L1=${n}`)
+                return doCompact({ archive: false })
+              })
+              // ★ 端结束就试一次整理（文档一直写的是"端结束 + 定时器"，原来只有定时器）。
+              //   拿不到钥匙（另一端正在整理）会自己跳过；不 await，不阻塞下一轮输入。
+              //   没有变化时 organize 直接返回，不会重写文件（见 memory6 的 changed 判断）。
+              .then(() => {
+                if (typeof mem.organize === 'function') {
+                  Promise.resolve().then(() => mem.organize()).catch(() => {})
+                }
               })
               .catch((err) => {
                 log.warn?.('[memory-tiers] 自动写入失败：%s', err?.message ?? err)
-                appendCaptureLog(dir, `turn 归档失败 user=${stat.user} tool=${stat.tool} rows=${rows.length} err=${err?.message ?? err}`)
+                appendCaptureLog(dir, `turn 归档失败 user=${stat.user} bot=${stat.bot} tool=${stat.tool} rows=${rows.length} err=${err?.message ?? err}`)
               })
           } else {
-            appendCaptureLog(dir, `turn 归档空 user=${stat.user} tool=${stat.tool}`)
+            appendCaptureLog(dir, `turn 归档空 user=${stat.user} bot=${stat.bot} tool=${stat.tool}`)
             Promise.resolve().then(doCompact).catch(() => {})
           }
         }
@@ -612,7 +682,7 @@ export function apply(ctx, config = {}) {
   //   ② 快照是**追加**在末尾的，前面历史的缓存不受影响，没什么可省的。
   //
   //   真正要节流的是 L3 的排序（决定哪些 DL3 条目进 L3），它在注入块最前面，
-  //   一动后面全断。那个节流在 memory5 的 l3View 里做，间隔 = refreshMinMs。
+  //   一动后面全断。那个节流在 memory6 的 L3 快照里做，间隔 = refreshMinMs。
   //
   //   这里只保留一条：内容没变就不重复追加，免得每轮多一条一模一样的 user 消息。
   let lastBlock = ''
@@ -634,6 +704,8 @@ export function apply(ctx, config = {}) {
           promptInjected: ok,
           semantic: !!silicon,
           autoCapture: cfg.autoCapture !== false,
+          layout,
+          writer,
           dir,
         }, null, 2),
         'utf8',
@@ -720,7 +792,7 @@ export function apply(ctx, config = {}) {
           kind: 'success',
           text: [
             `六层：${Object.entries(s.count).map(([k, v]) => `${k}=${v}`).join(' · ')}`,
-            `总条数 ${s.total} · 向量 ${s.vectors} · 待摘要 ${mem.pendingSummaries()}`,
+            `总条数 ${s.total} · 向量 ${s.vectors} · 待整理 ${s.temp ?? mem.pendingSummaries()}`,
             `数据目录 ${dir}`,
           ].join('\n'),
         }
@@ -731,6 +803,11 @@ export function apply(ctx, config = {}) {
   // ── 定时维护：deferred 摘要 + 周期收敛 ──
   // ctx.effect 的返回值是清理函数，插件卸载时 dsh 会调用；不写会泄漏定时器。
   ctx.effect?.(() => {
+    // split 布局：定时器由 memory6 自己管（5 分钟整理 + L3 刷新），这里只负责卸载时停掉。
+    if (typeof mem.stop === 'function') {
+      return () => { try { mem.stop() } catch { /* 已停 */ } }
+    }
+
     const flushTimer = setInterval(() => {
       mem.flushSummaries().catch((err) => log.warn?.('[memory-tiers] flush 失败：%s', err?.message ?? err))
     }, cfg.flushEveryMs)

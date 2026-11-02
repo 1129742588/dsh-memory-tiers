@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-tiers",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "description": "六层记忆插件：L1/L2/L3 活跃层 + DL1/DL2/DL3 深层，自动捕获写入、摘要沉淀、按需召回，并接管历史压缩（零 LLM）。",
   "type": "module",
   "main": "index.mjs",
@@ -34,6 +34,7 @@
     "./client": "./client.mjs",
     "./compaction.mjs": "./compaction.mjs",
     "./memory5.mjs": "./memory5.mjs",
+    "./memory6.mjs": "./memory6.mjs",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json",
     "./dshllm.mjs": "./dshllm.mjs"
@@ -44,6 +45,7 @@
     "settings.mjs",
     "compaction.mjs",
     "memory5.mjs",
+    "memory6.mjs",
     "silicon.mjs",
     "cordis.patch.yml",
     "README.md",
@@ -55,6 +57,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "reindex": "node reindex.mjs"
+    "reindex": "node reindex.mjs",
+    "test:m6": "node test-memory6.mjs"
   }
 }

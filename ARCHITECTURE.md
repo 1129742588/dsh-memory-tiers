@@ -39,6 +39,7 @@
 
 | 版本     | 日期    | 改了什么                                                              | 节       |
 | ------ | ----- | ----------------------------------------------------------------- | ------- |
+| v0.8.0 | 11-01 | **六文件布局**：`memory6.mjs` 取代 memory5 做默认。L1 = 真文件 + 每端 temp；谁先结束谁拿钥匙整理；溢出按整轮取；L1 记问+答；DL1 与 L2 旧半一起处理；L3 独立快照；检索按层读文件并顺着 sources 下探 DL2。旧数据不迁移，`layout: "legacy"` 可回退 | 26      |
 | v0.7.0 | 11-01 | **融合的边界**：跨写者不合并/不取代（`fuseDL3` 候选、搬层、连带作废、热度四处跳过外来条目）。修掉一个会**丢数据**的洞：跨文件判重会删掉自己的新摘要、把内容并到对方对象上（存不回去）。注入侧：自己的排前面，别人的条目只借剩余空间 | 13      |
 | v0.7.0 | 11-01 | **多写者共享目录**：存储按写者分片（各写各的 `store-<writer>.json`，读时合并），改数据只动自己的；目录可用指针文件 `~/.dsh/memory-tiers.json` 任意指定 | 13      |
 | —      | 11-01 | **文档二次校正**：清掉 `injectHot` 的全量残留（它已删除、三层恒定注入）；第 18 节默认改为**完全取替**；第 21 节默认模型改为 BAAI 那对；README 同步 | 16、18、20、21 |
@@ -2164,3 +2165,97 @@ DL3 摘要库  44   6000
   applied: ["preset","models.summary.base","models.summary.model","models.summary.source","noThink.summary"]
 回归 41+20+17 全过
 ```
+
+---
+
+## 26. 六文件布局（v0.8.0，覆盖第 13 节的多写者方案）
+
+> 第 13 节是 v0.7.0 的"每个写者一个分片、里面还是六层"。v0.8.0 起默认走
+> `memory6.mjs` 的六文件布局；第 13 节只在 `layout: "legacy"` 时仍然成立。
+
+### 为什么换
+
+分片方案只做到"数据能互相看见"：对方条目标 `__foreign`，`moveTo` / `fuseDL3` /
+`markSupersede` / `attend` 全跳过——**生命周期不共享**。六文件布局把整理权收给
+当轮拿到钥匙的一方，其余端只写自己的 temp。
+
+### 文件
+
+```
+memory/
+  L1.json                 真 L1（单文件，只有拿钥匙的一方写）
+  L1.tmp/<writer>.jsonl   每端追加自己的当前轮（追完就关）
+  L1.tmp/*.claimed-*      拿钥匙的人 rename 认领过来、正在并的（瞬态）
+  L2.json                 缓冲层（原文）
+  L3.json                 DL3 的排序快照（注入只读它，可从 DL3 重建）
+  DL1.json                流水（原文）
+  DL2.json                摘要引用的原文（只收被引用的，绝不单独进）
+  DL3.json                摘要池（真身）
+  signals/<writer>.jsonl  attend / pin / forget 请求
+  vectors/deep-*.json     整理者唯一写；两端只读
+  organize.lock           钥匙（心跳 10 分钟过期可接管）
+```
+
+**六个文件** = `L1/L2/L3/DL1/DL2/DL3`；`L1.tmp/` 是 L1 的暂存区，不算第七层。
+
+### 流程
+
+```
+端每次 turn 结束：
+  1. 这一轮的行（user / bot / tools，同一个 turnId）追加到 L1.tmp/<writer>.jsonl
+  2. 尝试拿钥匙（open('wx') 创建 organize.lock）
+     ├ 拿不到 → 本轮不整理，输入不受影响
+     └ 拿到 → 合并（只有它做）：
+          a. 扫遗留 *.claimed-*；把两边 temp rename 认领 → 按 id 去重并进 L1.json → 删 claimed
+          b. 先消费 signals（attend 可能把 DL1 升回 L2，别被 L2 摘要抢先）
+          c. L1 超 hotMaxChars/Items → 只挑"安静了 quietMs"的轮次，按 turnId 整轮取，
+             直到剩下 ≤ 上限/2 → 摘要（DL3/DL2/L2/DL1）
+          d. L2 超容量 → 同样整轮取旧半 + DL1 全部 → 再摘要；
+             第二次的 `+` 留在 L2（本轮最多 `l2KeepMax` 条，超出进 DL1），**绝不进 DL2**
+          e. 遗忘 DL1、saveDb（**先写 L2/DL1/DL2/DL3，最后写 L1**）、落向量
+          f. L3：内容变了或到 viewRefreshMs 才重写快照
+          g. 删钥匙
+```
+
+**触发**：一端结束 + `organizeEveryMs`（默认 5 分钟）定时器；两者都只是"尝试拿钥匙"。
+**不阻塞输入**：拿不到钥匙就跳过，整理晚一轮没有影响。
+
+### 关键不变式
+
+- **DL2 只收被摘要引用的原文**。`cid`（cited）→ DL2；`+` 只回 L2；没人提到的 → DL1。
+  摘要被删后留下的 DL2 孤儿，由 reconcile 移到 DL1。
+- **按 turnId 整轮取**：问题和回答不会被拆到两批。
+- **先写目标层，最后写 L1**：崩在中间 L1 还有原文，靠 id 去重，不重复不丢。
+- **整理卡太久被接管时**，`checkLock()` 发现钥匙不是自己的就放弃写入。
+- 注入读 `L1.json` + 所有 `L1.tmp/*`，刚结束的一轮下一轮就能看见（不等合并）。
+
+### 与 memory5 的差异
+
+| 项 | memory5（legacy） | memory6（split） |
+|---|---|---|
+| L1 | 每人一个 `store-<writer>.json`，里面六层 | 真 L1 + 每端 temp |
+| 整理 | 每端自己跑 `enforceLimits` | 谁先结束谁拿钥匙，只跑一份 |
+| 跨端 | 对方条目只读，不融合/不 attend | 深层单写者，跨端融合/检索/attend 都成立 |
+| L1 溢出 | 取最老一半（条数） | 按 turnId 整轮取，剩下 ≤ 一半 |
+| L1 内容 | 用户输入 + 工具 | 用户 + **assistant 正文（整轮 400 字）** + 工具 |
+| L3 | 内存视图，30 分钟算一次 | `L3.json` 快照，内容变/到间隔才重写 |
+| 检索 | 遍历 store.items，向量只读自己的 | 按层读文件，向量共用；detail 顺着 sources 下探 DL2 |
+| 配置 | `hotMaxChars: 2000` | `hotMaxChars: 3000`，`botCaptureChars: 400`，`quietMs: 10min`，`l2KeepMax: 10` |
+
+### 验收
+
+```
+node test-memory6.mjs     48 / 48
+node test-m5.mjs          41 / 41（legacy 回归）
+node test-batch.mjs       20 / 20
+node test-share.mjs       25 / 25（legacy 分片）
+真实模型手测：organize → DL3 摘要 + DL2 原文；search detail 命中 rel 0.93，原文标 via
+```
+
+### 已知限制
+
+- **不迁移旧数据**：split 从空开始，旧 `store.json` 原样保留；`layout: "legacy"` 可回退。
+- **两端必须都用 memory6**：astrbot 还在用 memory5 就不会写 `L1.tmp/astrbot.jsonl`，等于没共享。
+- **两端 embed 模型必须一致**（默认 `BAAI/bge-m3`）；其余阶段可不同。
+- **同名 writer 会写同一个 temp**：每个程序必须通过插件配置或 `MEMORY_WRITER` 给自己起不同的名字。
+- 设置页还没加 `layout` / `botCaptureChars` / `quietMs` / `organizeEveryMs` 的表单（可手改 config.json）。

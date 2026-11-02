@@ -21,16 +21,18 @@
 | 文件 | 作用 |
 |---|---|
 | `index.mjs` | dsh 插件入口：注册工具、订阅事件、注入上下文、调度压缩 |
-| `memory5.mjs` | 六层记忆核心：分层、热度、摘要、路由、检索、遗忘 |
+| `memory6.mjs` | **六文件布局（默认）**：L1.json + L1.tmp + L2/L3/DL1/DL2/DL3，谁先结束谁拿钥匙整理 |
+| `memory5.mjs` | 老的单文件分片布局（`layout: "legacy"` 回退用） |
 | `compaction.mjs` | 历史压缩：把 dsh 的 surface 压成占位，原文归档进记忆 |
 | `silicon.mjs` | 模型层：embed / 摘要 / 判关系（无 key 时语义检索关闭，只走关键词） |
 | `client.mjs` | 设置页前端（React section，挂 dsh「设置 → 记忆」） |
 | `settings.mjs` | 设置页后端：`/dsh-memory/api/*`，读写 config.json（字段白名单） |
 | `dshllm.mjs` | 借 dsh 自己的通道调**当前会话模型**（融合/摘要可跟它走，不用自己的 key） |
-| `reindex.mjs` | 换 embed 模型后重建向量库（`--dry` 可先体检） |
+| `reindex.mjs` | 换 embed 模型后重建向量库（只对 memory5/legacy 有效；split 会边整理边重算） |
 | `cordis.patch.yml` | 告诉 dsh 怎么把插件插进配置树 |
 | `package.json` | 包信息，`dsh.bundle.patch` 是关键字段 |
 | `ARCHITECTURE.md` | 完整架构、实测数据、已知问题清单（**权威文档**） |
+| `SHARED_MEMORY_PLAN.md` | 六文件布局的设计与决策记录 |
 
 ## 安装
 
@@ -58,8 +60,10 @@ export MEMORY_TIERS_DIR="~/my-memory"    # 或 D:/backup/memory
 
 或在插件配置里传 `dir`。**改不了 config.json 里的路径**——那个文件就在目录内部。
 
-整个目录是自包含的：`store.json` + `vectors-part-*.json` + `archive/` + `graveyard/` +
-`config.json`。**拷走整个目录，换个 agent、换个机器，改一下 `MEMORY_TIERS_DIR` 就能接着用。**
+整个目录是自包含的（split 布局）：`L1.json` + `L1.tmp/` + `L2.json` + `L3.json` +
+`DL1/DL2/DL3.json` + `signals/` + `vectors/` + `graveyard/` + `config.json`。
+**拷走整个目录，换个 agent、换个机器，改一下 `MEMORY_TIERS_DIR` 就能接着用。**
+（legacy 布局则是 `store-<writer>.json` + `vectors-<writer>-part-*.json` + `archive/`。）
 
 ## 打包
 
@@ -162,12 +166,16 @@ cat ~/.dsh/storages/memory-tiers/status.json
 
 | 参数 | 默认 | 含义 |
 |---|---|---|
-| `memoryCfg.hotMaxChars` | 2000 | L1 容量，同时也是注入量（**没有独立上限**） |
-| `memoryCfg.consolidateMaxChars` | 2500 | L2 容量：重要原话留住，不重要的沉去 DL1 遗忘 |
-| `memoryCfg.longMaxChars` | 4000 | L3 容量：摘要视图，信息密度最高，可以放宽 |
-| `refreshMinMs` | 1800000 | **L3 视图的重算间隔**（30 分钟）。只节流 L3——它排最前，一变后面缓存全断；L1/L2 随写随带 |
+| `memoryCfg.hotMaxChars` | 3000（split）/ 2000（legacy） | L1 容量：**达到就整理**（不是注入上限） |
+| `memoryCfg.consolidateMaxChars` | 2500 | L2 容量：满了取旧半 + DL1 全部做摘要 |
+| `memoryCfg.longMaxChars` | 4000 | L3 快照容量：摘要视图，信息密度最高，可以放宽 |
+| `refreshMinMs` | 1800000 | **L3 快照的重算间隔**（30 分钟）。内容变了会立刻重算，平时不动以保缓存 |
+| `botCaptureChars` | 400 | 一轮回复拼起来后截断（L1 要当最近历史用） |
+| `quietMs` | 600000 | 安静 10 分钟才允许整理 L1，避免腰斩正在聊的对话 |
+| `organizeEveryMs` | 300000 | 整理定时器（端结束时也会顺手试一次） |
 
-> **L1 / L2 / L3 恒定全部注入**，没有"是否注入"的开关，可调的只有各自容量。
+> **三层都会注入**，没有"是否注入"的开关。L1 按端配额（自己最多 70%，剩下的给另一端），
+> 超出部分留在文件里、不进上下文（不丢，等整理）。
 > **深层（DL1/DL2/DL3）不进上下文**，只在检索时命中，这是省 token 的关键。
 > dsh 自带的会话历史默认**一条不留**（由 L1 接管），也不再需要调。
 > 其余参数见 `ARCHITECTURE.md` 第 5 节（关键参数）。
@@ -175,23 +183,42 @@ cat ~/.dsh/storages/memory-tiers/status.json
 ## 多个程序共用一份记忆
 
 数据目录可以随便指（设置页「数据共享」里改，或环境变量 `MEMORY_TIERS_DIR`）。
-dsh 和 astrbot 指向同一个目录就能共享，但**每个程序的「写者标识」必须不一样**：
+dsh 和 astrbot 指向同一个目录就能共享，但**每个程序的「写者标识」必须不一样**。
+
+> ⚠️ **两端都要用 `memory6`（split）**。如果 astrbot 那边还在用 `memory5` / 旧的 `store-*.json`，
+> 它不会写 `L1.tmp/astrbot.jsonl`，也就不会共享——只是各记各的。升级时两边要一起换。
+
+**v0.8.0 起默认是六文件布局**（`layout: "split"`）：
 
 ```
 memory/
-  store-dsh.json      ← dsh 只写这份
-  store-astrbot.json  ← astrbot 只写这份
-  config.json         ← 共用配置
+  L1.json                 ← 真 L1：只有"拿到钥匙"的一方写
+  L1.tmp/dsh.jsonl        ← dsh 每轮追加（只写自己的）
+  L1.tmp/astrbot.jsonl    ← astrbot 每轮追加
+  L2.json                 ← 整理者写
+  L3.json                 ← DL3 的排序快照（注入只读它，按间隔刷新）
+  DL1.json / DL2.json / DL3.json
+  signals/<writer>.jsonl  ← attend / pin / forget 请求
+  organize.lock           ← 钥匙：谁先结束谁拿
+  vectors/deep-part-*.json
+  config.json             ← 共用配置
 ```
 
-各写各的文件（不需要锁，谁也不覆盖谁），读的时候合并成一个视图——
-检索和上下文注入能看到全部，但分流、遗忘、融合只动自己写的那份。
-对方一落盘，你这边下一次检索就能看到。
+规则：
 
-已知限制：不跨写者去重 / 取代 / 融合（那都要改对方的条目，而对方的分片我们没资格写），
-所以两边记了同一件事会各留一条。这不是"懒得做"——跨文件判重会把自己的新摘要删掉、
-内容并到对方对象上存不回去，等于凭空丢一条记忆，所以代码里是显式禁掉的。
-另外向量也按写者分片，搜别人的记忆主要靠关键词。
+1. **端只写自己的 temp**（一行一条、追完就关），不调模型、不算向量，写入是毫秒级。
+2. **谁先结束谁拿钥匙**（创建 `organize.lock`）：把两边的 temp `rename` 认领、按 id 去重并进 `L1.json`，
+   再判断 L1/L2 是否到阈值；拿不到钥匙就跳过本轮整理，**不阻塞对话**。
+3. 只有拿钥匙的一方写 `L2/L3/DL1/DL2/DL3` 和向量，所以深层不再有"别人的条目只读"的问题，
+   跨端去重 / 取代 / 融合 / 语义检索全部成立。
+4. 注入读 `L1.json` + 所有 `L1.tmp/*`（按 id 去重），所以对方刚结束的那一轮**下一轮就能看见**。
+5. 钥匙带心跳，10 分钟没更新允许另一端接管；崩了最多晚一轮，不丢。
+
+**旧数据**：`layout: "split"` 从空开始，旧的 `store.json` / `vectors-*.json` 原样保留。
+想回退就把 `config.json` 改成 `"layout": "legacy"` 重启，回到 memory5 的单文件分片。
+
+**嵌入模型必须两端一致**（默认 `BAAI/bge-m3`）；其余模型阶段（摘要/融合）可以各端不同——
+整理用哪端的配置，取决于当轮谁拿到钥匙。
 
 ## 排错对照表
 
@@ -200,7 +227,7 @@ memory/
 | 重启后没反应，也看不到工具 | `package.json` 的 `dsh.bundle.patch` 丢了，或 `cordis.patch.yml` 里的 `name` 和包名不一致 | 检查这两个字符串是否都是 `dsh-memory-tiers` |
 | 日志里出现"未能注入系统提示词" | 你这个 dsh 版本的 `systemPrompt` API 名字不一样 | 告诉我版本号，改 `index.mjs` 里 `injectPrompt()` 那 10 行 |
 | 工具能看到但不被调用 | 模型不知道什么时候该用 | 改工具的 `description`，把触发场景写具体 |
-| 记了一大堆但想不起来 | 没填 `apiKey` 时语义检索是关的，只有关键词命中 | 填硅基流动 key，再跑 `node reindex.mjs` 补向量 |
+| 记了一大堆但想不起来 | 没填 `apiKey` 时语义检索是关的，只有关键词命中 | 填硅基流动 key 重启；split 布局会边整理边算向量（`reindex.mjs` 只对 legacy 有效） |
 
 ## 一句实话
 

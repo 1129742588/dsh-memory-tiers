@@ -54,6 +54,10 @@ function eventRole(ev) {
 export async function compactSurface(session, mem, opts = {}) {
   const keepTurns = Math.max(0, Number(opts.keepTurns ?? 1))
   const archiveChars = Math.max(100, Number(opts.archiveChars ?? 1200))
+  // ★ 归档开关：autoCapture 已经把这一轮（问+答+工具）写进 L1 了，
+  //   这里再归档一次会把同一轮存两遍。所以调用方在"rows 已写成功"时传 archive:false，
+  //   只做"把历史换成占位"，不再抄一份进记忆。
+  const doArchive = opts.archive !== false
   const log = opts.log || console
 
   const nodes = session?.surface?.nodes
@@ -107,52 +111,55 @@ export async function compactSurface(session, mem, opts = {}) {
   const endSeq = sliceSeqs[sliceSeqs.length - 1]
 
   // ── 先把要丢的内容归档进记忆，写成功才动手丢 ──
-  const lines = []
-  let totalChars = 0
-  let dropped = 0
-  // ★ 只归档「真人在说」「模型在答」「工具结果」三类。
-  //   surface 里还混着 runtime-context（工作目录/沙箱策略）、skill-catalog（技能清单）、
-  //   time-context（时间快照）——这些是框架注入的，归档进去不仅没用，
-  //   还会把注入块（含记忆块自身）原样抄进记忆，形成自我污染。
-  const ARCHIVABLE = new Set(['user', 'model', 'tool'])
-  for (const seq of sliceSeqs) {
-    const ev = session.eventAt(seq)
-    if (!ev) continue
-    const src = (ev.data?.message ?? ev.data)?.source
-    if (!ARCHIVABLE.has(src?.kind)) { dropped++; continue }
-    const t = eventText(ev)
-    if (!t) { dropped++; continue }
-    const line = `${eventRole(ev)}: ${t}`
-    if (totalChars + line.length > archiveChars) {
-      // ★ 不能整段丢掉：至少保留能塞下的部分，否则归档变成一句「（还有 N 条略）」，
-      //   这个 bug 在第一次上线时真实发生过（3 条空归档躺在 L1 里）。
-      const room = archiveChars - totalChars
-      if (room > 60) {
-        lines.push(line.slice(0, room - 1) + '…')
-        totalChars += room
-      }
-      dropped += sliceSeqs.length - lines.length
-      break
-    }
-    lines.push(line)
-    totalChars += line.length
-  }
-  if (dropped > 0 && lines.length) lines.push(`…（另有 ${dropped} 条系统注入或过长内容未收录）`)
-
+  //   archive:false 时整段跳过（这一轮已经由 autoCapture 的 rows 写进 L1 了）。
   let archived = 0
-  if (lines.length && mem?.writeMany) {
-    try {
-      const rounds = userIdx.filter((i) => i < keepStart).length
-      const res = await mem.writeMany([{
-        text: `[归档] 前 ${rounds} 轮对话（已被压缩出上下文）：\n${lines.join('\n')}`,
-        speaker: 'archive',
-        channel: 'dialog',
-      }])
-      archived = Array.isArray(res) ? res.length : 1
-    } catch (err) {
-      // ★ 归档失败就绝不压缩：宁可上下文大，也不能丢内容
-      log.warn?.('[memory-tiers] 压缩前归档失败，放弃本次压缩：%s', err?.message ?? err)
-      return { compacted: false, removed: 0, archived: 0, reason: 'archive-failed' }
+  if (doArchive) {
+    const lines = []
+    let totalChars = 0
+    let dropped = 0
+    // ★ 只归档「真人在说」「模型在答」「工具结果」三类。
+    //   surface 里还混着 runtime-context（工作目录/沙箱策略）、skill-catalog（技能清单）、
+    //   time-context（时间快照）——这些是框架注入的，归档进去不仅没用，
+    //   还会把注入块（含记忆块自身）原样抄进记忆，形成自我污染。
+    const ARCHIVABLE = new Set(['user', 'model', 'tool'])
+    for (const seq of sliceSeqs) {
+      const ev = session.eventAt(seq)
+      if (!ev) continue
+      const src = (ev.data?.message ?? ev.data)?.source
+      if (!ARCHIVABLE.has(src?.kind)) { dropped++; continue }
+      const t = eventText(ev)
+      if (!t) { dropped++; continue }
+      const line = `${eventRole(ev)}: ${t}`
+      if (totalChars + line.length > archiveChars) {
+        // ★ 不能整段丢掉：至少保留能塞下的部分，否则归档变成一句「（还有 N 条略）」，
+        //   这个 bug 在第一次上线时真实发生过（3 条空归档躺在 L1 里）。
+        const room = archiveChars - totalChars
+        if (room > 60) {
+          lines.push(line.slice(0, room - 1) + '…')
+          totalChars += room
+        }
+        dropped += sliceSeqs.length - lines.length
+        break
+      }
+      lines.push(line)
+      totalChars += line.length
+    }
+    if (dropped > 0 && lines.length) lines.push(`…（另有 ${dropped} 条系统注入或过长内容未收录）`)
+
+    if (lines.length && mem?.writeMany) {
+      try {
+        const rounds = userIdx.filter((i) => i < keepStart).length
+        const res = await mem.writeMany([{
+          text: `[归档] 前 ${rounds} 轮对话（已被压缩出上下文）：\n${lines.join('\n')}`,
+          speaker: 'archive',
+          channel: 'dialog',
+        }])
+        archived = Array.isArray(res) ? res.length : 1
+      } catch (err) {
+        // ★ 归档失败就绝不压缩：宁可上下文大，也不能丢内容
+        log.warn?.('[memory-tiers] 压缩前归档失败，放弃本次压缩：%s', err?.message ?? err)
+        return { compacted: false, removed: 0, archived: 0, reason: 'archive-failed' }
+      }
     }
   }
 

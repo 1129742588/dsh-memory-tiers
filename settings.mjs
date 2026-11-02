@@ -21,12 +21,17 @@ const WRITABLE = {
   compactArchiveChars: 'number',
   userCaptureChars: 'number',
   toolCaptureChars: 'number',
+  botCaptureChars: 'number',   // 一轮 assistant 正文拼起来后截多少（L1 当最近历史用）
+  quietMs: 'number',           // 安静多久才允许整理 L1
+  organizeEveryMs: 'number',   // 整理定时器
   budgetTokens: 'number',
   flushEveryMs: 'number',
   sweepEveryMs: 'number',
   // 'siliconflow' = 嵌入/重排用那两个免费模型；'custom' = 用 models 里自己填的
   preset: 'string',
-  // ★ 多写者标识：共用同一个数据目录时每个程序必须不同（决定写哪份 store-<writer>.json）
+  // ★ 布局：'split' = 六文件（默认）；'legacy' = 老的单文件分片（回退用）
+  layout: 'string',
+  // ★ 多写者标识：共用同一个数据目录时每个程序必须不同
   writer: 'string',
 }
 
@@ -157,11 +162,22 @@ export function installSettingsApi(ctx, opts) {
         },
         live: {
           dir,
-          // 多写者：我自己是谁、还有谁在往这个目录写（看目录里有哪些 store-*.json）
+          layout: live.layout || 'split',
+          // 多写者：我自己是谁、还有谁在往这个目录写
+          // split 布局看 L1.tmp/*.jsonl，legacy 看 store-*.json
           writer: live.writer || 'default',
           peers: (() => {
             try {
-              return readdirSync(dir)
+              const files = readdirSync(dir)
+              if (files.includes('L1.tmp') || files.includes('L1.json')) {
+                try {
+                  return readdirSync(join(dir, 'L1.tmp'))
+                    .filter((f) => f.endsWith('.jsonl'))
+                    .map((f) => f.replace(/\.jsonl$/, '').split('.')[0])
+                    .filter(Boolean)
+                } catch { return [] }
+              }
+              return files
                 .map((f) => f.match(/^store-([A-Za-z0-9_-]+)\.json$/)?.[1])
                 .filter(Boolean)
             } catch { return [] }
@@ -172,6 +188,9 @@ export function installSettingsApi(ctx, opts) {
           vectors: stats?.vectors ?? null,
           total: stats?.total ?? null,
           byChannel: stats?.byChannel ?? null,
+          temp: stats?.temp ?? null,
+          lock: stats?.lock ?? null,
+          last: stats?.last ?? null,
           semantic: !!(live.apiKey || process.env.SILICONFLOW_API_KEY ||
             Object.values(live.models || {}).some((m) => m?.apiKey)),
           autoCompact: live.autoCompact !== false,
