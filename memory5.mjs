@@ -1,7 +1,7 @@
 /**
  * 四层记忆 v5 —— 二次重构骨架
  *
- * 与 memory4 的区别（详见 REFACTOR_PLAN.md）：
+ * 与 memory4 的区别（详见 ARCHITECTURE.md）：
  *   1. 三层活跃流水线：及时层 → 巩固层 → 长久层
  *   2. 层用单一 `layer` 字段表达，不再用 weight × tier 交叉
  *   3. 新增 heat（热度）+ 按天去重的提及计数，替代"一次性判定 importance"
@@ -58,7 +58,7 @@ const ACTIVE_ORDER = [LAYER.HOT, LAYER.CONSOLIDATE, LAYER.LONG]
 // ============================================================
 // 配置
 //
-// heat 相关参数由 tune.mjs 扫描 32 组得出，见 REFACTOR_PLAN D12。
+// heat 相关参数由 tune.mjs 扫描 32 组得出，结论见 ARCHITECTURE.md 第 4 节。
 // ============================================================
 
 export const DEFAULTS = {

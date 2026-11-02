@@ -31,8 +31,7 @@
 | `reindex.mjs` | 换 embed 模型后重建向量库（只对 memory5/legacy 有效；split 会边整理边重算） |
 | `cordis.patch.yml` | 告诉 dsh 怎么把插件插进配置树 |
 | `package.json` | 包信息，`dsh.bundle.patch` 是关键字段 |
-| `ARCHITECTURE.md` | 完整架构、实测数据、已知问题清单（**权威文档**） |
-| `SHARED_MEMORY_PLAN.md` | 六文件布局的设计与决策记录 |
+| `ARCHITECTURE.md` | 完整架构、实测数据、已知问题、待办与决策（**唯一文档**） |
 
 ## 安装
 

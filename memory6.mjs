@@ -1,7 +1,7 @@
 /**
  * memory6.mjs —— 六层 · 六个文件（split 布局）
  *
- * 和 memory5 的区别（设计见 SHARED_MEMORY_PLAN.md）：
+ * 和 memory5 的区别（设计见 ARCHITECTURE.md 第 26 节）：
  *
  *   1. 六个文件六层：L1.json / L2.json / L3.json / DL1.json / DL2.json / DL3.json
  *      L1.tmp/ 是 L1 的暂存区（每端一个 append-only 文件），不算第七层。
