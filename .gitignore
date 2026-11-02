@@ -28,3 +28,5 @@ _*.py
 .DS_Store
 Thumbs.db
 *.log
+.modeltest_*/
+.test-share*/
