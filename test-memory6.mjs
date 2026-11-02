@@ -392,6 +392,46 @@ console.log('⑮ 注入不依赖深层文件（不再全量读 DL1/DL2/DL3）')
   rmSync(K, { recursive: true, force: true })
 }
 
+// ============================================================
+console.log('⑯ 只读缓存：命中 / 文件变了失效 / 不污染 / 超限不缓存')
+// ============================================================
+{
+  const L = '.test-m6-cache'
+  rmSync(L, { recursive: true, force: true })
+  mode = 'citeAll'
+  const a = mk(L, 'dsh', { cacheMaxFileBytes: 1024 * 1024, cacheMaxTotalBytes: 4 * 1024 * 1024 })
+  a.writeTurn([
+    { text: '爬山' + 'x'.repeat(60), speaker: 'user', channel: 'dialog', turnId: 'c1' },
+    { text: '爬山回来' + 'y'.repeat(60), speaker: 'bot', channel: 'dialog', turnId: 'c1' },
+  ])
+  await a.organize()
+
+  const r1 = a._readCached('DL3')
+  const r2 = a._readCached('DL3')
+  ok('两次读命中同一数组', r1 === r2, `${r1.length} 条`)
+  ok('统计有命中', a._cache().hits >= 1, JSON.stringify(a._cache()))
+
+  // 模拟对方写盘：内容变了，mtime/size 都会变
+  const p = `${L}/DL3.json`
+  const j = JSON.parse(readFileSync(p, 'utf8'))
+  j.items.push({ ...j.items[0], id: 'added1', text: '新加的' })
+  writeFileSync(p, JSON.stringify({ ...j, at: Date.now() + 1 }))
+  const r3 = a._readCached('DL3')
+  ok('文件变了就重读（不是旧缓存）', r3 !== r1 && r3.some((it) => it.id === 'added1'))
+
+  const l1 = a.list('DL3')
+  const l2 = a.list('DL3')
+  ok('list 返回数组副本', l1 !== l2 && l1 !== r3)
+  l1.push({ id: 'evil' })
+  ok('改副本不影响缓存', a._readCached('DL3').length === r3.length, String(a._readCached('DL3').length))
+
+  const b = mk(L, 'dsh', { cacheMaxFileBytes: 10 })   // 10 字节：任何层都超限
+  const s1 = b._readCached('DL3')
+  const s2 = b._readCached('DL3')
+  ok('超过单文件上限就不缓存', s1 !== s2 && s1.length === s2.length)
+  rmSync(L, { recursive: true, force: true })
+}
+
 rmSync('.test-m6', { recursive: true, force: true })
 rmSync('.test-m6-sig', { recursive: true, force: true })
 rmSync('.test-m6-l2', { recursive: true, force: true })

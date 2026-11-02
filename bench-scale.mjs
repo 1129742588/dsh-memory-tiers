@@ -145,7 +145,7 @@ async function benchSearch() {
   const silicon = key ? createSilicon({ apiKey: key, base: 'https://api.siliconflow.cn/v1', budgetTokens: 0 }) : null
 
   console.log(`\n=== 检索规模测试（${silicon ? '带 embed/rerank' : '纯本地，不连模型'}）===`)
-  console.log('每层条数   DL 文件合计   建库      注入(L1+L2+L3)  summary      detail       full')
+  console.log('每层条数   DL 文件合计   建库      注入(L1+L2+L3)  summary(首次→缓存)  detail(首次→缓存)  full(首次→缓存)')
 
   for (const n of sizes) {
     const dir = join('.bench-scale', `n${n}`)
@@ -161,8 +161,10 @@ async function benchSearch() {
     writeFileSync(join(dir, 'L3.json'), JSON.stringify({ version: 2, at: Date.now(), items: makeRows(20, 'L3') }))
     const buildMs = Date.now() - tBuild0
 
+    const cacheMB = Number(argv.cache) || 0
     const mem = createMemory6({
       dir, writer: 'bench', embedSignature: 'none',
+      ...(cacheMB ? { cfg: { cacheMaxTotalBytes: cacheMB * 1024 * 1024 } } : {}),
       ...(silicon ? { embed: (t) => silicon.embed(t), rerank: (q, d) => silicon.rerank(q, d) } : {}),
     })
 
@@ -170,19 +172,25 @@ async function benchSearch() {
     const block = mem.buildBlock()
     const injectMs = Date.now() - t1
 
+    // 每个深度跑两次：第一次解析，第二次走缓存
     const time = async (depth) => {
       const t = Date.now()
-      const r = await mem.search('爬山 风很大', { depth, limit: 6 })
-      return { ms: Date.now() - t, hits: r.hits.length }
+      const a = await mem.search('爬山 风很大', { depth, limit: 6 })
+      const first = Date.now() - t
+      const t2 = Date.now()
+      const b = await mem.search('爬山 风很大', { depth, limit: 6 })
+      const second = Date.now() - t2
+      return { first, second, hits: b.hits.length }
     }
     const s1 = await time('summary')
     const s2 = await time('detail')
     const s3 = await time('full')
+    const cell = (s) => `${ms(s.first)}→${ms(s.second)}(${s.hits})`
 
     console.log(
       `${String(n).padStart(8)}  ${mb(bytes).padStart(11)}  ${ms(buildMs).padStart(7)}  ` +
       `${(ms(injectMs) + `(${block.length}字)`).padStart(15)}  ` +
-      `${(ms(s1.ms) + `(${s1.hits})`).padStart(10)}  ${(ms(s2.ms) + `(${s2.hits})`).padStart(10)}  ${(ms(s3.ms) + `(${s3.hits})`).padStart(10)}`
+      `${cell(s1).padStart(18)}  ${cell(s2).padStart(18)}  ${cell(s3).padStart(18)}`
     )
     if (!KEEP) rmSync(join('.bench-scale', `n${n}`), { recursive: true, force: true })
   }

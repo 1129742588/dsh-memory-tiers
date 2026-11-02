@@ -64,6 +64,18 @@ export const DEFAULTS6 = {
   // 第二次整理（L2 溢出）时，`+` 最多留这么多条在 L2；超出的进 DL1。
   // DL2 只放"被摘要引用的原文"，`+` 永远不进 DL2。
   l2KeepMax: 10,
+
+  // —— 只读层缓存（search / buildBlock / stats）——
+  // 深层有十万条时，每次检索都要 JSON.parse 几十 MB，实测 0.4~1.7 秒。
+  // 缓存解析结果后是毫秒级。三条上限都是为了"宁可慢，不可崩"：
+  cacheMaxFileBytes: 64 * 1024 * 1024,          // 单文件超过 64MB 不缓存（约 20 万条）
+  cacheMaxTotalBytes: 384 * 1024 * 1024,        // 缓存总量上限（超出按 LRU 淘汰）
+  cacheHeapLimitBytes: 1.5 * 1024 * 1024 * 1024, // 堆已用超过 1.5GB 就放弃缓存
+  // 每层的预算占比：按"谁最常被读"分，而不是先到先得。
+  // 不分预算的话，一个超大的 DL1 会把 DL2/DL3 全挤出去，
+  // 每次检索都在"重读 → 淘汰 → 再重读"之间颠簸（实测比不缓存还慢）。
+  // 注意这是**上限**：某层超预算就不缓存它，不会去挤别的层。
+  cacheLayerShare: { DL3: 0.4, DL2: 0.3, DL1: 0.3 },
 }
 
 const DATA_LAYERS = ['L1', 'L2', 'DL1', 'DL2', 'DL3']
@@ -246,6 +258,95 @@ export function createMemory6(o = {}) {
 
   function writeLayer(name, items) {
     atomicWrite(paths[name], JSON.stringify({ version: 2, at: Date.now(), items }, null, 1))
+  }
+
+  // ============================================================
+  // 只读层缓存
+  //
+  // ★ 只给**只读路径**用：search / buildBlock / stats / list。
+  //   整理路径（loadDb → digest → saveDb）必须走 readLayer 直读——
+  //   digest 会就地改条目（layer / text / supersededBy / sources），
+  //   如果改的是缓存里的对象，就成了"内存里有、磁盘上没有"，下次读还拿到脏数据。
+  //
+  // ★ 失效判据是 mtime + size，和"每次都读"完全等价，只是省掉 JSON.parse：
+  //   对方一写盘（tmp + rename），mtime 必变，下一次读就重解析。
+  //
+  // ★ 防内存不足（三条闸门，触发任一条就退回直读，不影响正确性）：
+  //     单文件 > cacheMaxFileBytes    → 不缓存（大库只慢，不涨内存）
+  //     估算占用 > cacheMaxTotalBytes → LRU 淘汰到上限以内
+  //     堆已用 > cacheHeapLimitBytes  → 清空缓存，本轮不写
+  // ============================================================
+  const layerCache = new Map()       // name -> { sig, items, bytes }
+  let cacheBytes = 0
+  const cacheStat = { hits: 0, misses: 0, evicts: 0, skipped: 0 }
+
+  const cacheLimitFile = Number(cfg.cacheMaxFileBytes) || 64 * 1024 * 1024
+  const cacheLimitTotal = Number(cfg.cacheMaxTotalBytes) || 384 * 1024 * 1024
+  const cacheHeapLimit = Number(cfg.cacheHeapLimitBytes) || 1.2 * 1024 * 1024 * 1024
+
+  function layerSig(name) {
+    try { const st = statSync(paths[name]); return { sig: `${st.mtimeMs}:${st.size}`, size: st.size } } catch { return null }
+  }
+
+  function clearLayerCache() { layerCache.clear(); cacheBytes = 0 }
+
+  function readLayerCached(name) {
+    const meta = layerSig(name)
+    const hit = meta ? layerCache.get(name) : null
+    if (hit && hit.sig === meta.sig) {
+      cacheStat.hits++
+      layerCache.delete(name); layerCache.set(name, hit)   // LRU：挪到队尾
+      return hit.items
+    }
+
+    cacheStat.misses++
+    // 解析本身仍可能失败（文件损坏）——和原来一样抛给调用方，不吞异常
+    const items = readLayer(name)
+
+    try {
+      if (!meta || meta.size > cacheLimitFile) { cacheStat.skipped++; return items }
+      // 解析后的对象大约是 JSON 文本的 2~3 倍
+      const bytes = meta.size * 3
+      const share = Number(cfg.cacheLayerShare?.[name]) || 0.1
+      const layerLimit = cacheLimitTotal * share
+      if (bytes > layerLimit) { cacheStat.skipped++; return items }
+      if (process.memoryUsage().heapUsed > cacheHeapLimit) {
+        clearLayerCache()
+        cacheStat.skipped++
+        return items
+      }
+      if (hit) { cacheBytes -= hit.bytes; layerCache.delete(name) }
+      layerCache.set(name, { sig: meta.sig, items, bytes })
+      cacheBytes += bytes
+      while (cacheBytes > cacheLimitTotal && layerCache.size > 1) {
+        const [k, v] = layerCache.entries().next().value
+        layerCache.delete(k)
+        cacheBytes -= v.bytes
+        cacheStat.evicts++
+      }
+    } catch { /* 缓存失败不影响读到的数据 */ }
+    return items
+  }
+
+  /**
+   * 层内 id → 条目索引（懒建，挂在缓存条目上，建一次一直用）。
+   * 返回 null 表示这层没进缓存（文件太大 / 堆太紧），调用方退回线性查找。
+   */
+  function cachedIndex(name) {
+    const hit = layerCache.get(name)
+    const meta = layerSig(name)
+    if (!hit || !meta || hit.sig !== meta.sig) return null
+    if (!hit.byId) {
+      hit.byId = new Map()
+      for (const it of hit.items) hit.byId.set(it.id, it)
+    }
+    return hit.byId
+  }
+
+  /** 确保某层已进缓存并返回索引；没进缓存返回 null */
+  function ensureIndex(name) {
+    try { readLayerCached(name) } catch { return null }
+    return cachedIndex(name)
   }
 
   function tempPath(w = writer) { return join(tmpDir, `${w}.jsonl`) }
@@ -443,9 +544,9 @@ export function createMemory6(o = {}) {
    */
   function readL1View({ placed = null } = {}) {
     const temp = readTempsAll()
-    const base = (() => { try { return readLayer('L1') } catch { return [] } })()
+    const base = (() => { try { return readLayerCached('L1') } catch { return [] } })()
     const all = dedupe([...base, ...temp.items])
-    try { for (const it of readLayer('L2')) placed.add(it.id) } catch { /* 忽略 */ }
+    try { for (const it of readLayerCached('L2')) placed.add(it.id) } catch { /* 忽略 */ }
     return { items: placed ? all.filter((it) => !placed.has(it.id)) : all, bad: temp.bad }
   }
 
@@ -993,7 +1094,7 @@ export function createMemory6(o = {}) {
 
   /** 从 DL3 按 importance×heat 截前 N 条（纯计算，不写盘） */
   function computeL3(db = null, now = tick()) {
-    const pool = (db && db.DL3) ? db.DL3 : (() => { try { return readLayer('DL3') } catch { return [] } })()
+    const pool = (db && db.DL3) ? db.DL3 : (() => { try { return readLayerCached('DL3') } catch { return [] } })()
     const scored = pool
       .filter((it) => !it.supersededBy)
       .map((it) => ({ it, s: scoreOf(it, now) }))
@@ -1164,7 +1265,7 @@ export function createMemory6(o = {}) {
     l3 = l3.filter((it) => !it.supersededBy)
     // L2 只读一次：既用来拼"最近沉淀的"，顺手当"已下沉"的 id 集合给 L1 视图去重
     let l2raw = []
-    try { l2raw = readLayer('L2') } catch { l2raw = [] }
+    try { l2raw = readLayerCached('L2') } catch { l2raw = [] }
     const l2 = l2raw.filter((it) => !it.supersededBy)
     const l1r = readL1View({ placed: new Set(l2raw.map((it) => it.id)) })
     const l1 = l1r.items.filter((it) => !it.supersededBy)
@@ -1254,7 +1355,7 @@ export function createMemory6(o = {}) {
     const layers = DEPTH_LAYERS[depth] || DEPTH_LAYERS.summary
     const pool = []
     for (const l of layers) {
-      try { for (const it of readLayer(l)) pool.push(it) } catch { /* 单层坏了不影响别层 */ }
+      try { for (const it of readLayerCached(l)) pool.push(it) } catch { /* 单层坏了不影响别层 */ }
     }
 
     const scored = []
@@ -1319,20 +1420,18 @@ export function createMemory6(o = {}) {
 
     // detail/full：顺着摘要的 sources 去 DL2/DL1 取原文（比拿查询扫 DL2 准）
     if (depth !== 'summary' && opts.followSources !== false) {
-      const byId = new Map()
-      for (const it of pool) byId.set(it.id, it)
-      for (const l of ['DL2', 'DL1']) {
-        if (byId.has(`__loaded_${l}`)) continue
-        try { for (const it of readLayer(l)) if (!byId.has(it.id)) byId.set(it.id, it) } catch { /* 忽略 */ }
-        byId.set(`__loaded_${l}`, true)
-      }
+      // ★ 不再把 DL2/DL1 整层塞进 Map：10 万条时要 20 万次 set/has，每检索一次。
+      //   改成"按需查索引"——索引挂在缓存条目上，建一次一直用。
+      const idxD2 = ensureIndex('DL2')
+      const idxD1 = ensureIndex('DL1')
+      const findDeep = (id) => (idxD2 && idxD2.get(id)) || (idxD1 && idxD1.get(id)) || null
       const seen = new Set(hits.map((h) => h.id))
       const extra = []
       for (const h of hits) {
         if (h.kind !== 'summary' || !h.sources?.length) continue
         for (const id of h.sources) {
           if (seen.has(id)) continue
-          const it = byId.get(id)
+          const it = findDeep(id)
           if (!it) continue
           seen.add(id)
           extra.push({
@@ -1372,12 +1471,12 @@ export function createMemory6(o = {}) {
     } catch { count.L1 = 0; charsBy.L1 = 0 }
     for (const l of ['L2', 'DL1', 'DL2', 'DL3']) {
       let items = []
-      try { items = readLayer(l) } catch { /* 损坏的层按 0 展示，但 audit 里有记录 */ }
+      try { items = readLayerCached(l) } catch { /* 损坏的层按 0 展示，但 audit 里有记录 */ }
       count[l] = items.length
       charsBy[l] = chars(items)
     }
     let l3 = []
-    try { l3 = readLayer('L3') } catch { /* 忽略 */ }
+    try { l3 = readLayerCached('L3') } catch { /* 忽略 */ }
     count.L3 = l3.length
     charsBy.L3 = chars(l3)
     const temp = readTempsAll()
@@ -1392,11 +1491,13 @@ export function createMemory6(o = {}) {
   }
 
   function list(layer = null) {
-    if (layer === 'L3') { try { return readLayer('L3') } catch { return [] } }
-    if (layer === 'L1') return readL1View().items
-    if (layer) { try { return readLayer(layer) } catch { return [] } }
+    // ★ 一律返回数组副本：读的是缓存里的数组，直接给出去的话，
+    //   调用方一个 sort/push 就把缓存改脏了（对象本身仍共享，只读字段可以用）。
+    if (layer === 'L3') { try { return readLayerCached('L3').slice() } catch { return [] } }
+    if (layer === 'L1') return readL1View().items.slice()
+    if (layer) { try { return readLayerCached(layer).slice() } catch { return [] } }
     const out = [...readL1View().items]
-    for (const l of ['L2', 'DL1', 'DL2', 'DL3']) { try { out.push(...readLayer(l)) } catch { /* 忽略 */ } }
+    for (const l of ['L2', 'DL1', 'DL2', 'DL3']) { try { out.push(...readLayerCached(l)) } catch { /* 忽略 */ } }
     return out
   }
 
@@ -1445,5 +1546,8 @@ export function createMemory6(o = {}) {
     pendingSummaries: () => 0,
     // 常量 / 调试
     LAYER, cfg, dir, writer, _paths: paths, _readLayer: readLayer,
+    _readCached: readLayerCached,
+    _cache: () => ({ size: layerCache.size, bytes: cacheBytes, ...cacheStat }),
+    _clearCache: clearLayerCache,
   }
 }
