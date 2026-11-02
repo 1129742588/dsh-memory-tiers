@@ -30,3 +30,5 @@ Thumbs.db
 *.log
 .modeltest_*/
 .test-share*/
+.sim-real/
+sim-real-report.txt

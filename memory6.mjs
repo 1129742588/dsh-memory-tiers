@@ -688,6 +688,16 @@ export function createMemory6(o = {}) {
           audit(`SUPERSEDE ${top.it.id} ← ${sum.id}`)
           return 'superseded'
         }
+        if (type === 'update') {
+          // 进展：两条都留，但记下"新的接在旧的后面"。
+          // ★ memory5 有这个分支，memory6 最初漏了 —— 结果模型判 update 时
+          //   既不记 updates 链接、也不打日志，看起来像"融合完全没生效"。
+          sum.updates = top.it.id
+          db.DL3.push(sum)
+          l3Dirty = true
+          audit(`FUSE_UPDATE ${top.it.id} → ${sum.id}（进展，两条都保留）`)
+          return 'updated'
+        }
       }
     }
     db.DL3.push(sum)

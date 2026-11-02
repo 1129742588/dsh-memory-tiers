@@ -912,6 +912,7 @@ export function createSilicon(options = {}) {
       '你判断两条记忆的关系，只输出一个词。',
       '',
       'duplicate      同一件事，只是措辞不同。「别发表情」和「不要发表情包」',
+      '               同一条规则被重复强调也算 duplicate（哪怕措辞、语气、补充细节不同）',
       'contradiction  后一条推翻了前一条。「别发表情」和「多发表情」',
       'update         后一条是前一条的进展或补充，不冲突。',
       '               「Dice 0.86」和「Dice 涨到 0.88」不是矛盾，是进展。',
