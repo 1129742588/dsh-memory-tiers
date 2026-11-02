@@ -1491,6 +1491,11 @@ export function createMemory5(o = {}) {
   // 迁移
   // ============================================================
   function moveTo(item, layer, reason, now) {
+    // ★ 别人的条目不搬层：它在别人的分片里，我们改了也存不回去，
+    //   下次读盘就被他自己的版本覆盖掉；更糟的是本次会话里它会被
+    //   当成"我方数据"参与注入和容量计算，重启前后行为不一致。
+    //   别人的层、热度、作废标记一律只读。
+    if (!item || item.__foreign) return
     const from = item.layer
     if (from === layer) return
 
@@ -1642,6 +1647,8 @@ export function createMemory5(o = {}) {
     const affected = []
     for (const it of store.items) {
       if (it.kind !== 'summary' || it.supersededBy) continue
+      // 别人的摘要不在我们的分片里，打不上作废标记（打了也存不回去）
+      if (it.__foreign) continue
       if ((it.sources || []).includes(oldItem.id)) {
         it.supersededBy = newItem.id
         affected.push(it.id)
@@ -1678,9 +1685,16 @@ export function createMemory5(o = {}) {
     if (!nv) return null
 
     // 只和 DL3 里的摘要比（摘要 vs 摘要），不碰原文
+    //
+    // ★ 只跟**自己的**摘要比。别人的摘要在别人的分片里，一旦被判成"重复"
+    //   就会被合并进来、而我们这一条会被删掉——删掉的写进了自己的分片
+    //   （永久生效），合并的结果却落在别人的对象上（存不回去，重启即失效）。
+    //   一合一删之后，这条内容两边都不剩，等于凭空丢一条记忆。
+    //   所以跨写者不做判重 / 取代 / 融合，只做检索和注入。
     const cands = []
     for (const it of store.items) {
       if (it.id === newItem.id) continue
+      if (it.__foreign) continue
       if (it.layer !== LAYER.DL_LONG || it.kind !== 'summary') continue
       if (it.supersededBy) continue
       const v = store.vectors.get(it.id)
@@ -2713,6 +2727,9 @@ export function createMemory5(o = {}) {
     for (const id of list) {
       const it = find(id)
       if (!it) continue
+      // 别人的条目：热度/关注次数存在他的分片里，我们加的这一下重启就没了，
+      // 反而让本次会话的排序和重启后不一致（同一条记忆两次查询排位不同）。
+      if (it.__foreign) continue
       touchHeat(it, now, cfg)
       it.recallCount = (Number(it.recallCount) || 0) + 1
       n++
@@ -2984,8 +3001,14 @@ export function createMemory5(o = {}) {
     // ★ L3 是视图：从 DL3 按 importance×热度 截取。
     //   截出来之后按 seq 升序排——新增加末尾，前面逐字节不变，前缀缓存能命中。
     const long = l3View().sort((a, b) => a.seq - b.seq)
-    const cons = byLayer(LAYER.CONSOLIDATE, { all: true }).sort((a, b) => a.seq - b.seq)
-    const hot = byLayer(LAYER.HOT, { all: true }).sort((a, b) => b.seq - a.seq)   // 最新的在前
+    // ★ 共享目录里别人的条目也进上下文，但排在自己人后面：
+    //   容量是我们按自己的条目维护的（enforceLimits 只动自己的），
+    //   先到先得的话，对方写得越多，我们自己的条目被挤掉得越多。
+    const ownFirst = (a, b) => (a.__foreign ? 1 : 0) - (b.__foreign ? 1 : 0)
+    const cons = byLayer(LAYER.CONSOLIDATE, { all: true })
+      .sort((a, b) => ownFirst(a, b) || (a.seq - b.seq))
+    const hot = byLayer(LAYER.HOT, { all: true })
+      .sort((a, b) => ownFirst(a, b) || (b.seq - a.seq))   // 最新的在前
 
     // 作废条不进上下文：新的那条已经在里面了，再放旧的只会让模型看到两条相反的指令。
     // 想查历史可以走 search（那里会改写成"（已作废）…"）。
@@ -3029,8 +3052,17 @@ export function createMemory5(o = {}) {
     //     L1 ← hotMaxChars（同理）
     //   以前是 bootMaxChars 当总闸门、L3 吃光后 L2 只剩零头（实测 351 字只进 55 字），
     //   结果「刚沉淀的对话」优先级反而低于「一周前的群聊」——不合理。
-    const hotLines = includeHot ? pack(visible(hot), Infinity) : []
-    const consLines = pack(visible(cons), Infinity)
+    // ★ 单写者时下面等价于直接 pack(..., Infinity)：容量本来就是硬上限，
+    //   多写者时才生效——别人的条目只能"借"剩下的空间，
+    //   自己那份已经占满时仍留 30% 给共享方（不然对方一条都进不来，共享就没意义了）。
+    const packShared = (list, limit) => {
+      const mine = pack(list.filter((it) => !it.__foreign), Infinity)
+      const used = mine.reduce((s, l) => s + l.length + 1, 0)
+      return mine.concat(pack(list.filter((it) => it.__foreign), Math.max(Math.round(limit * 0.3), limit - used)))
+    }
+
+    const hotLines = includeHot ? packShared(visible(hot), cfg.hotMaxChars) : []
+    const consLines = packShared(visible(cons), cfg.consolidateMaxChars)
 
     const parts = []
     if (longLines.length) parts.push('## 一直记得的', ...longLines)

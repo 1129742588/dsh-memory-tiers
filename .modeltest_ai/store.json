@@ -1,0 +1,150 @@
+{
+  "version": 3,
+  "seq": 6,
+  "items": [
+    {
+      "id": "mmvxmkhbth075",
+      "seq": 1,
+      "text": "假阴性率太高了，宁可多报几个也别漏",
+      "kind": "raw",
+      "channel": "action",
+      "weight": "normal",
+      "tier": "active",
+      "importance": 0.6,
+      "tags": [],
+      "origin": "chat",
+      "speaker": "主人",
+      "people": [
+        "主人"
+      ],
+      "scene": "",
+      "day": "2026-11-01",
+      "createdAt": 1793525153328,
+      "lastAccess": 1793525156217,
+      "accessCount": 3,
+      "hits": 0,
+      "pinned": false,
+      "archiveFile": null
+    },
+    {
+      "id": "mmvxmkhsoyiq4",
+      "seq": 2,
+      "text": "把预处理改成按 1.5mm 重采样，跑通了，Dice 从 0.86 涨到 0.88",
+      "kind": "raw",
+      "channel": "action",
+      "weight": "normal",
+      "tier": "active",
+      "importance": 0.6,
+      "tags": [],
+      "origin": "chat",
+      "speaker": "我",
+      "people": [
+        "我"
+      ],
+      "scene": "",
+      "day": "2026-11-01",
+      "createdAt": 1793525153940,
+      "lastAccess": 1793525157395,
+      "accessCount": 4,
+      "hits": 0,
+      "pinned": false,
+      "archiveFile": null
+    },
+    {
+      "id": "mmvxmki8o6yec",
+      "seq": 3,
+      "text": "周末去不去爬山，我说看天气",
+      "kind": "raw",
+      "channel": "dialog",
+      "weight": "normal",
+      "tier": "active",
+      "importance": 0.25,
+      "tags": [],
+      "origin": "chat",
+      "speaker": "星鲸",
+      "people": [
+        "星鲸"
+      ],
+      "scene": "",
+      "day": "2026-11-01",
+      "createdAt": 1793525154513,
+      "lastAccess": 1793525156217,
+      "accessCount": 2,
+      "hits": 0,
+      "pinned": false,
+      "archiveFile": null
+    },
+    {
+      "id": "mmvxmkiof6c9j",
+      "seq": 4,
+      "text": "清了一轮空标注，删掉 37 个坏样本",
+      "kind": "raw",
+      "channel": "action",
+      "weight": "normal",
+      "tier": "active",
+      "importance": 0.6,
+      "tags": [],
+      "origin": "chat",
+      "speaker": "我",
+      "people": [
+        "我"
+      ],
+      "scene": "",
+      "day": "2026-11-01",
+      "createdAt": 1793525155080,
+      "lastAccess": 1793525155947,
+      "accessCount": 2,
+      "hits": 0,
+      "pinned": false,
+      "archiveFile": null
+    },
+    {
+      "id": "mmvxmkj46x3br",
+      "seq": 5,
+      "text": "和附属医院谈好了，下个月能拿到 200 例带病理的 CT",
+      "kind": "raw",
+      "channel": "action",
+      "weight": "normal",
+      "tier": "active",
+      "importance": 0.6,
+      "tags": [],
+      "origin": "chat",
+      "speaker": "主人",
+      "people": [
+        "主人"
+      ],
+      "scene": "",
+      "day": "2026-11-01",
+      "createdAt": 1793525155652,
+      "lastAccess": 1793525156217,
+      "accessCount": 3,
+      "hits": 0,
+      "pinned": false,
+      "archiveFile": null
+    },
+    {
+      "id": "mmvxmkj8okrs4",
+      "seq": 6,
+      "text": "今天有点困，喝了两杯咖啡",
+      "kind": "raw",
+      "channel": "dialog",
+      "weight": "normal",
+      "tier": "active",
+      "importance": 0.25,
+      "tags": [],
+      "origin": "chat",
+      "speaker": "艾小",
+      "people": [
+        "艾小"
+      ],
+      "scene": "",
+      "day": "2026-11-01",
+      "createdAt": 1793525155783,
+      "lastAccess": 1793525156217,
+      "accessCount": 2,
+      "hits": 0,
+      "pinned": false,
+      "archiveFile": null
+    }
+  ]
+}

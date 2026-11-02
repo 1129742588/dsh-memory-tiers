@@ -108,6 +108,50 @@ console.log('④ 旧库 store.json 只认领一次')
   rmSync(F, { recursive: true, force: true })
 }
 
+console.log('⑤ 融合只在自己的分片里做（跨文件不合并、不取代）')
+{
+  const G = '.test-share4'
+  rmSync(G, { recursive: true, force: true })
+  // 同一个向量 = 相似度为 1，只要有候选就一定会被判成重复
+  const V = [1, 0, 0]
+  const stub = (writer) => createMemory5({
+    dir: G,
+    writer,
+    embedSignature: 'none',
+    embed: async (ts) => ts.map(() => V),
+    judgeRelation: async () => 'duplicate',
+  })
+  const dsh = stub('dsh')
+  const bot = stub('astrbot')
+
+  bot._seed(makeItem({ text: '群里不要发表情包', layer: LAYER.DL_LONG, kind: 'summary', at: now }), V)
+  bot._store.save()
+  dsh._store.refreshForeign()
+
+  const foreign = dsh._store.items.find((it) => !dsh._store.isOwn(it))
+  ok('能看到对方的摘要', !!foreign && foreign.text.includes('表情包'))
+  const snap = (it) => JSON.stringify({ t: it.text, l: it.layer, h: it.heat, s: it.supersededBy, f: it.fusionCount })
+  const before = snap(foreign)
+
+  const mine = dsh._seed(makeItem({ text: '群里不要发表情包（dsh 自己记的）', layer: LAYER.DL_LONG, kind: 'summary', at: now }), V)
+  const r = await dsh.fuseDL3(mine, now)
+  ok('不跟对方的摘要合并', r === null, JSON.stringify(r))
+  ok('自己这条还在（不会被判重删掉）', dsh._store.items.includes(mine))
+  ok('对方的条目一字未改', snap(foreign) === before, snap(foreign))
+
+  const mine2 = dsh._seed(makeItem({ text: '群里不要发表情包（第二次）', layer: LAYER.DL_LONG, kind: 'summary', at: now }), V)
+  const r2 = await dsh.fuseDL3(mine2, now)
+  ok('自己库内的重复照样合并', !!r2 && r2.type === 'duplicate' && !dsh._store.items.includes(mine2))
+  ok('合并后对方的还是没动', snap(foreign) === before)
+
+  dsh._store.save()
+  bot._store.save()
+  const jd = JSON.parse(readFileSync(`${G}/store-dsh.json`, 'utf8'))
+  const jb = JSON.parse(readFileSync(`${G}/store-astrbot.json`, 'utf8'))
+  ok('各自落盘仍只含自己的', jd.items.every((it) => !it.__foreign) && jb.items.length === 1)
+  rmSync(G, { recursive: true, force: true })
+}
+
 rmSync(D, { recursive: true, force: true })
 console.log(`\n  ${pass} / ${pass + fail} 通过`)
 process.exit(fail ? 1 : 0)
