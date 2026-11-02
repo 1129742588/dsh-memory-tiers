@@ -44,7 +44,7 @@ const PLUGIN_DEFAULTS = {
   apiBase: 'https://api.siliconflow.cn/v1',
   // 每个阶段：{ source: 'session' } 跟当前会话模型，或 { base, apiKey, model } 走外部
   models: { chat: { source: 'session' }, summary: { source: 'session' } },
-  noThink: { chat: true, summary: false },
+  noThink: { chat: true, summary: true },
   bootMaxChars: 0,               // 0 = 不限制，注入量由 L1/L2/L3 各自容量决定
   budgetTokens: 0,
   autoCapture: true,          // 自动订阅 session/event 写入 L1
@@ -262,7 +262,7 @@ export function apply(ctx, config = {}) {
           summary: { source: 'session' },
         },
         // 关思考：融合只要一个词，关掉更快更省；摘要要它想清楚，默认不关
-        noThink: { chat: true, summary: false },
+        noThink: { chat: true, summary: true },
         _说明: [
           'apiKey 填硅基流动的 key（也可以设环境变量 SILICONFLOW_API_KEY）；',
           '留空则语义检索关闭：检索只走关键词，向量文件不读也不写（不造假向量）。',
@@ -278,7 +278,7 @@ export function apply(ctx, config = {}) {
           '  想多留一点临时内容，把 L1 容量（memoryCfg.hotMaxChars）调大即可。',
           'preset = siliconflow 时，嵌入用 BAAI/bge-m3、重排用 BAAI/bge-reranker-v2-m3（都免费）；custom 则用 models 里填的。',
           'models[stage].source = session 表示这个阶段跟着当前对话用的模型走（不用额外 key）；api 则走下面填的地址/key。',
-          'noThink = 是否关思考。chat（融合判关系）默认关，summary 默认不关。',
+          'noThink = 是否关思考。默认都关（实测开思考摘要慢 3 倍）；想要更细的摘要可以给 summary 打开。',
           'writer = 写者标识。多个程序共用本目录时每个必须不同：split 布局下各写 L1.tmp/<writer>.jsonl，',
           '  读的时候合起来。同名会分不清是谁。改完重启。',
           'layout = split（六文件，默认）/ legacy（老的单文件分片，回退用）。',

@@ -1,278 +1,268 @@
-# dsh-memory-tiers · 六层记忆 + 历史压缩
+# dsh-memory-tiers
 
-> **v0.6.0**（2026-11-01）。架构细节、实测数据、踩过的坑全在 [`ARCHITECTURE.md`](./ARCHITECTURE.md)。
-> 本文只讲「它干什么」和「怎么用」。
->
-> 架构文档按主题分了 A–D 四个区，开头有**变更索引**（哪个版本改了什么、在第几节）。
-> 改代码前先看那里，别只看本文——本文为了好读，省略了大量约束和实测数据。
+给 dsh 加长期记忆，同时把每轮对话的 token 压住不涨。
 
-## 它做三件事
+装好之后你不用刻意「记一下」——它自己记、自己整理、需要时自己找回来。
 
-1. **自动记忆**：订阅 `session/event`，每轮结束把你说的话、我调的工具写进记忆（L1），
-   满了自动摘要沉淀到 L2/L3 和深层 DL1/DL2/DL3。
-2. **注入上下文**：每轮把 L3（长期摘要）+ L2（最近沉淀）+ L1（刚发生的，默认开）
-   作为一条 user 快照**追加**在末尾注入，内容不变就不刷新。
-   追加在末尾，所以前面历史的 prompt cache 不受影响。
-3. **接管历史压缩**：每轮结束把 dsh 自带的会话历史全部压成一条 20 字占位（默认一条不留），
-   **零 LLM 调用**，被压掉的内容先归档进记忆。上下文因此保持恒定，不随轮数增长。
+---
 
-## 文件清单
+## 它解决两个问题
 
-| 文件 | 作用 |
-|---|---|
-| `index.mjs` | dsh 插件入口：注册工具、订阅事件、注入上下文、调度压缩 |
-| `memory6.mjs` | **六文件布局（默认）**：L1.json + L1.tmp + L2/L3/DL1/DL2/DL3，谁先结束谁拿钥匙整理 |
-| `memory5.mjs` | 老的单文件分片布局（`layout: "legacy"` 回退用） |
-| `compaction.mjs` | 历史压缩：把 dsh 的 surface 压成占位，原文归档进记忆 |
-| `silicon.mjs` | 模型层：embed / 摘要 / 判关系（无 key 时语义检索关闭，只走关键词） |
-| `client.mjs` | 设置页前端（React section，挂 dsh「设置 → 记忆」） |
-| `settings.mjs` | 设置页后端：`/dsh-memory/api/*`，读写 config.json（字段白名单） |
-| `dshllm.mjs` | 借 dsh 自己的通道调**当前会话模型**（融合/摘要可跟它走，不用自己的 key） |
-| `reindex.mjs` | 换 embed 模型后重建向量库（只对 memory5/legacy 有效；split 会边整理边重算） |
-| `cordis.patch.yml` | 告诉 dsh 怎么把插件插进配置树 |
-| `package.json` | 包信息，`dsh.bundle.patch` 是关键字段 |
-| `ARCHITECTURE.md` | 完整架构、实测数据、已知问题、待办与决策（**唯一文档**） |
+**① 上下文不够用**
+
+dsh 聊久了会遇到两种结局：要么历史太长爆上下文，要么被压缩掉、事后想不起来。
+这个插件把对话记到本地，压缩掉的内容仍在库里，随时能搜回来。
+
+**② 每轮花费随历史增长**
+
+默认它会接管 dsh 的历史压缩：**上一轮说完，历史就被压成一条 20 字占位**（一条不留），
+下一轮只带记忆块 + 你这句话。上下文长度不随轮数增长，token 花费也就平了。
+
+省下来的比它花的多：整理是有触发条件的（L1/L2 满了），不是每轮都调模型。
+
+---
+
+## 它怎么做到（一句话版）
+
+记忆分六层：**L1/L2/L3** 是活跃层，每轮拼进上下文；**DL1/DL2/DL3** 是深层，只在检索时用。
+
+```
+你说的话 → L1（刚发生的）→ 满了取一半 → 重要的进 L2/L3，不重要的沉 DL1 → DL1 里的按时间忘掉
+```
+
+原理、实测数据、边界条件都在 [`ARCHITECTURE.md`](./ARCHITECTURE.md)，本文只讲怎么用。
+
+---
 
 ## 安装
 
+**方式一：dsh 插件市场**（推荐）
+
+在 dsh 的插件市场里搜 `dsh-memory-tiers`，安装后重启。
+
+**方式二：npm**
+
 ```bash
-# 方式一：链接本地目录（改代码立刻生效，开发时用）
+cd ~/.dsh/profiles/desktop
+pnpm add dsh-memory-tiers
+```
+
+然后把 `dsh-memory-tiers` 加进该 profile `package.json` 的 `dsh.profile.bundles`，重启 dsh。
+
+**方式三：本地链接**（改代码时用）
+
+```bash
 cd ~/.dsh/profiles/desktop
 pnpm add "link:/path/to/dsh-memory-tiers"
-
-# 方式二：装打包好的 tgz（分发用）
-cd ~/.dsh/profiles/desktop
-pnpm add /path/to/dsh-memory-tiers-0.3.0.tgz
 ```
-
-然后把 `dsh-memory-tiers` 加进该 profile `package.json` 的 `dsh.profile.bundles`，**重启 dsh**。
-
-配置文件在 `<数据目录>/config.json`，首次启动自动生成。
-
-### 数据目录（可指定，便于备份迁移）
-
-默认 `~/.dsh/storages/memory-v5`。想换地方，用环境变量（支持 `~`）：
-
-```bash
-export MEMORY_TIERS_DIR="~/my-memory"    # 或 D:/backup/memory
-```
-
-或在插件配置里传 `dir`。**改不了 config.json 里的路径**——那个文件就在目录内部。
-
-整个目录是自包含的（split 布局）：`L1.json` + `L1.tmp/` + `L2.json` + `L3.json` +
-`DL1/DL2/DL3.json` + `signals/` + `vectors/` + `graveyard/` + `config.json`。
-**拷走整个目录，换个 agent、换个机器，改一下 `MEMORY_TIERS_DIR` 就能接着用。**
-（legacy 布局则是 `store-<writer>.json` + `vectors-<writer>-part-*.json` + `archive/`。）
-
-## 打包
-
-```bash
-npm pack --pack-destination ./dist
-```
-
-产物 `dist/dsh-memory-tiers-<版本>.tgz`，只含 `package.json` 里 `files` 列出的运行时文件
-（测试、模拟脚本、数据集都不打进去）。**新增文件记得同步 `files`**，
-漏了会在安装后才炸（`ERR_MODULE_NOT_FOUND`）——`compaction.mjs` 就差点栽在这。
 
 ---
 
-## 以下是 v1 时代的设计笔记（**历史存档，勿照着改**）
+## 第一次配置（三步）
 
-> ⚠️ 这一整段描述的是早期原型，和当前实现差异很大（层名、参数、检索方式都变了）。
-> 留着只作背景。**要改代码请以 `ARCHITECTURE.md` 为准**。
+重启 dsh 后，数据目录里会自动生成 `config.json`。改配置有两个入口：
 
+- **设置页**：dsh → 设置 → 记忆（推荐，改完重启生效）
+- **手改** `<数据目录>/config.json`
 
-## 第一步：先看它跑起来（不用装 dsh）
+### 第一步：填模型 Key
 
-```bash
-cd dsh-memory-tiers
-node test.mjs
+记忆的「语义检索」和「摘要」需要模型。不填也能用，但只能按关键词搜，且不会自动整理。
+
+去 <https://cloud.siliconflow.cn> 注册，拿一个 `sk-` 开头的 Key，填到：
+
+- 设置页 → 记忆 → 嵌入与重排 → API 密钥
+- 或 `config.json` 里的 `apiKey`
+
+默认用硅基流动的两个免费模型：
+
+| 用途 | 默认模型 | 费用 |
+|---|---|---|
+| 嵌入（向量化） | `BAAI/bge-m3` | 免费 |
+| 重排（精排） | `BAAI/bge-reranker-v2-m3` | 免费 |
+
+摘要和判关系默认**跟着你当前会话的模型**走，不额外花钱。
+
+### 第二步：给这个程序起个名字
+
+`writer` 是这个程序在数据目录里的身份，**每个程序必须不一样**：
+
+```json
+{ "writer": "dsh" }
 ```
 
-你会看到完整的生命周期：5 条记忆先全落在 L1 → 时间快进 4 天 → 3 条升 L2、2 条沉到 `archive/*.md` → 搜"验证"能翻出旧账 → 搜"环境"把冷存那条拉回来（回温）。最后打印出"每轮注入的提示词"长什么样。
+- 只有 dsh 用：填什么都行（默认 `default`）
+- 和 astrbot 共用一份记忆：一个填 `dsh`，一个填 `astrbot`
 
-**这一步是你理解它的最快方式**，比读文档快十倍。
+填成一样的两个程序会往同一份临时文件里写，不会丢，但分不清是谁说的。
 
-## 第二步：装进 dsh（已在你机器上做好了）
+### 第三步：确认数据目录
 
-> **重要事实（我实测过）**：桌面版 dsh 的 `desktop` profile 被 Electron 应用独占，命令行装不进去 —— 会报
-> `error: profile "desktop" is managed exclusively by the Electron application`。
-> 所以插件装在了独立的 `web` profile 里，用 `dsh web` 启动的那个实例。
-
-装的时候需要 pnpm（dsh 的插件管理就是转发给 pnpm），我已经装好了（`pnpm 12.15.0`）。
+默认 `~/.dsh/storages/memory-v5`。想放别处（比如 D 盘、同步盘）：
 
 ```bash
-# 已经执行过的两条，你不用再跑
-npm i -g pnpm
-cd dsh-memory-tiers && npx -y @deepseek-ai/dsh plugin --profile web add ./
+export MEMORY_TIERS_DIR="D:/memory"      # 支持 ~ 和绝对路径
 ```
 
-装完之后 `~/.dsh/profiles/web/package.json` 里会多出 `"dsh-memory-tiers": "link:...你的目录"`。
-**因为是 link，所以你改了 `memory.mjs` 重启就生效，不用重装。**
+或者在插件配置里传 `dir`。**不要试图改 `config.json` 里的路径**——那个文件本身就在目录里。
 
-## 第三步：启动并验证
+---
 
-```bash
-npx -y @deepseek-ai/dsh web
-```
+## 配置详解
 
-浏览器会打开 `http://127.0.0.1:3080/?token=...`（token 每次不同，别用旧的）。
+### 记忆容量（最常调）
 
-验证插件真的活着，看这个文件：
+三层各自有容量，容量就是**每轮注入多少字**（没有单独的上限开关）：
 
-```bash
-cat ~/.dsh/storages/memory-tiers/status.json
-```
+| 参数 | 默认 | 含义 | 调大会怎样 |
+|---|---|---|---|
+| `memoryCfg.hotMaxChars` | 3000 | L1 容量：刚说的话 | 记得更多细节，token 更多 |
+| `memoryCfg.consolidateMaxChars` | 2500 | L2 容量：最近沉淀的原话 | 同上 |
+| `memoryCfg.longMaxChars` | 4000 | L3 容量：长期摘要 | L3 段更长，检索信息更全 |
+
+三层合计约 9500 字（约 7000 token）。觉得占上下文多就调小，觉得记不住就调大。
+
+> L1 上限也是**整理触发线**：写满 3000 字才取一半整理。调太小会整理得很频繁。
+
+### 历史压缩
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `autoCompact` | `true` | 每轮结束把 dsh 历史压成一条占位（零 LLM 调用） |
+| `compactKeepTurns` | `0` | 保留最近几轮原文。0 = 一条不留（L1 里已经有） |
+
+**想保留一点原文**就把它改成 2~3，代价是 token 会随轮数涨一点。
+
+### 模型
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `apiKey` / `apiBase` | 空 / 硅基流动 | 嵌入与重排用 |
+| `preset` | `siliconflow` | `siliconflow` 用上面两个免费模型；`custom` 走 `models` 里自己填的 |
+| `models.chat` | `{ source: "session" }` | 判关系用哪个模型。`session` = 跟当前会话 |
+| `models.summary` | `{ source: "session" }` | 摘要用哪个模型 |
+| `noThink.chat` | `true` | 判关系关思考（只要一个词，思考是浪费） |
+| `noThink.summary` | `true` | 摘要关思考。**打开思考会更慢（实测慢 3 倍），但摘要可能更细** |
+
+想换成别的 provider（DeepSeek 官方、OpenAI 兼容接口都行）：
 
 ```json
 {
-  "loadedAt": "2026-10-26T09:02:17.193Z",
-  "tools": 6,
-  "promptInjected": true,   ← 这两个是重点
-  "dir": "C:\\Users\\Anxiple\\.dsh\\storages\\memory-tiers"
+  "preset": "custom",
+  "models": {
+    "embed":  { "base": "https://api.siliconflow.cn/v1", "apiKey": "sk-xxx", "model": "BAAI/bge-m3" },
+    "summary": { "base": "https://api.deepseek.com/v1", "apiKey": "sk-xxx", "model": "deepseek-chat" }
+  }
 }
 ```
 
-`tools: 6` 说明六个工具都注册上了，`promptInjected: true` 说明记忆已经接进系统提示词。
-然后在对话框里输 `/memory`：
+> 嵌入模型一旦换了，旧向量不可比较，插件会自动隔离旧向量并重建。**两个程序共用记忆时，嵌入模型必须一致。**
 
-```
-三层记忆：L1=0 · L2=0 · L3=0（钉住 0）
-数据目录：C:\Users\Anxiple\.dsh\storages\memory-tiers
-```
+### 整理节奏
 
-数据实际存在 `~/.dsh/storages/memory-tiers/`：`store.json` 是状态表，`archive/` 是冷存正文，都可以直接用编辑器打开看。
-
----
-
-## 踩过的坑（你以后一定会遇到）
-
-| 报错 / 现象 | 真正原因 | 解法 |
+| 参数 | 默认 | 说明 |
 |---|---|---|
-| `函数 'memory_xxx'：schema 必须是 'type: "object"' 的 JSON 模式，获得 'type: null'` | 工具参数用了 `{ id: {...} }` 简写，只有官方 `defineTool` 能把它编译成 schema；而插件目录 import 不到 `@deepseek-ai/dsh-tools`，静默回退成裸对象，dsh 判成 null | 手写 `{ type:'object', properties:{...}, required:[...] }`，不要依赖 defineTool |
-| `cannot get property "systemPrompt" without inject` | Cordis 里访问任何 `ctx.xxx` 前都必须在 `inject` 里声明过 | 用 `ctx.inject(['systemPrompt'], cb)` 包起来，别直接读 `ctx.systemPrompt` |
-| 插件加载了但模型完全看不到记忆 | `section()` 的签名是 `{ name, order, text }`，不是 `{ id, content }`，写错会被 try/catch 悄悄吞掉 | 现在写错了会直接抛错，不会再静默失败 |
-| `profile "desktop" is managed exclusively by the Electron application` | 桌面版独占 profile | 换 `web` profile，或用桌面端的插件市场（只收 npm 包） |
-| `pnpm: command not found` | dsh 的 `plugin` 命令只是把参数转给 pnpm | `npm i -g pnpm` |
+| `quietMs` | 600000（10 分钟） | 一段对话安静这么久才允许整理，避免聊到一半被腰斩 |
+| `organizeEveryMs` | 300000（5 分钟） | 定时补一轮整理（拿不到钥匙会自己跳过） |
+| `refreshMinMs` | 1800000（30 分钟） | L3 摘要段的重算间隔。它在上下文最前面，变一次后面缓存全失效 |
 
+### 两端共享一份记忆
 
-## 想调什么，改哪里
+两个程序指向同一个目录就是共享：
 
-**优先用设置页**：dsh → 设置 → 记忆（v0.4.0 起有界面，v0.6.0 又改版过）。
-改完**重启 dsh** 生效。它和直接改 `config.json` 写的是同一个文件。
+```json
+// dsh 的 config.json
+{ "layout": "split", "writer": "dsh" }
 
-真正常动的是三层容量，它们直接决定每轮往上下文里塞多少字：
-
-| 参数 | 默认 | 含义 |
-|---|---|---|
-| `memoryCfg.hotMaxChars` | 3000（split）/ 2000（legacy） | L1 容量：**达到就整理**（不是注入上限） |
-| `memoryCfg.consolidateMaxChars` | 2500 | L2 容量：满了取旧半 + DL1 全部做摘要 |
-| `memoryCfg.longMaxChars` | 4000 | L3 快照容量：摘要视图，信息密度最高，可以放宽 |
-| `refreshMinMs` | 1800000 | **L3 快照的重算间隔**（30 分钟）。内容变了会立刻重算，平时不动以保缓存 |
-| `botCaptureChars` | 400 | 一轮回复拼起来后截断（L1 要当最近历史用） |
-| `quietMs` | 600000 | 安静 10 分钟才允许整理 L1，避免腰斩正在聊的对话 |
-| `organizeEveryMs` | 300000 | 整理定时器（端结束时也会顺手试一次） |
-
-> **三层都会注入**，没有"是否注入"的开关。L1 按端配额（自己最多 70%，剩下的给另一端），
-> 超出部分留在文件里、不进上下文（不丢，等整理）。
-> **深层（DL1/DL2/DL3）不进上下文**，只在检索时命中，这是省 token 的关键。
-> dsh 自带的会话历史默认**一条不留**（由 L1 接管），也不再需要调。
-> 其余参数见 `ARCHITECTURE.md` 第 5 节（关键参数）。
-
-## 多个程序共用一份记忆
-
-数据目录可以随便指（设置页「数据共享」里改，或环境变量 `MEMORY_TIERS_DIR`）。
-dsh 和 astrbot 指向同一个目录就能共享，但**每个程序的「写者标识」必须不一样**。
-
-> ⚠️ **两端都要用 `memory6`（split）**。如果 astrbot 那边还在用 `memory5` / 旧的 `store-*.json`，
-> 它不会写 `L1.tmp/astrbot.jsonl`，也就不会共享——只是各记各的。升级时两边要一起换。
-
-**v0.8.0 起默认是六文件布局**（`layout: "split"`）：
-
-```
-memory/
-  L1.json                 ← 真 L1：只有"拿到钥匙"的一方写
-  L1.tmp/dsh.jsonl        ← dsh 每轮追加（只写自己的）
-  L1.tmp/astrbot.jsonl    ← astrbot 每轮追加
-  L2.json                 ← 整理者写
-  L3.json                 ← DL3 的排序快照（注入只读它，按间隔刷新）
-  DL1.json / DL2.json / DL3.json
-  signals/<writer>.jsonl  ← attend / pin / forget 请求
-  organize.lock           ← 钥匙：谁先结束谁拿
-  vectors/deep-part-*.json
-  config.json             ← 共用配置
+// astrbot 侧
+{ "layout": "split", "writer": "astrbot" }
 ```
 
 规则：
 
-1. **端只写自己的 temp**（一行一条、追完就关），不调模型、不算向量，写入是毫秒级。
-2. **谁先结束谁拿钥匙**（创建 `organize.lock`）：把两边的 temp `rename` 认领、按 id 去重并进 `L1.json`，
-   再判断 L1/L2 是否到阈值；拿不到钥匙就跳过本轮整理，**不阻塞对话**。
-3. 只有拿钥匙的一方写 `L2/L3/DL1/DL2/DL3` 和向量，所以深层不再有"别人的条目只读"的问题，
-   跨端去重 / 取代 / 融合 / 语义检索全部成立。
-4. 注入读 `L1.json` + 所有 `L1.tmp/*`（按 id 去重），所以对方刚结束的那一轮**下一轮就能看见**。
-5. 钥匙带心跳，10 分钟没更新允许另一端接管；崩了最多晚一轮，不丢。
+- 各自只写自己的 `L1.tmp/<writer>.jsonl`，注入时合并
+- 谁先结束谁拿「钥匙」整理，同一时刻只有一个在整理
+- 深层（L2/L3/DL1~3）只有一个写者，不会互相覆盖
 
-**旧数据**：`layout: "split"` 从空开始，旧的 `store.json` / `vectors-*.json` 原样保留。
-想回退就把 `config.json` 改成 `"layout": "legacy"` 重启，回到 memory5 的单文件分片。
-
-**嵌入模型必须两端一致**（默认 `BAAI/bge-m3`）；其余模型阶段（摘要/融合）可以各端不同——
-整理用哪端的配置，取决于当轮谁拿到钥匙。
-
-## 排错对照表
-
-| 现象 | 原因 | 怎么办 |
-|---|---|---|
-| 重启后没反应，也看不到工具 | `package.json` 的 `dsh.bundle.patch` 丢了，或 `cordis.patch.yml` 里的 `name` 和包名不一致 | 检查这两个字符串是否都是 `dsh-memory-tiers` |
-| 日志里出现"未能注入系统提示词" | 你这个 dsh 版本的 `systemPrompt` API 名字不一样 | 告诉我版本号，改 `index.mjs` 里 `injectPrompt()` 那 10 行 |
-| 工具能看到但不被调用 | 模型不知道什么时候该用 | 改工具的 `description`，把触发场景写具体 |
-| 记了一大堆但想不起来 | 没填 `apiKey` 时语义检索是关的，只有关键词命中 | 填硅基流动 key 重启；split 布局会边整理边算向量（`reindex.mjs` 只对 legacy 有效） |
-
-## 一句实话
-
-> 这段是 v1 时代的判断，**两条都已不成立**：召回现在是「向量召回 + rerank 精排 + 关键词」
-> 三级流水线，蒸馏是真调模型的摘要。留着只是提醒自己别退回去。
-
-现在的实话是**：语义能力依赖你接没接模型**。
-
-- **接了模型**（填了硅基流动 key）：检索走向量 + rerank，入库能判重判矛盾，L1/L2 溢出有真摘要。
-- **没接模型**：语义检索直接关闭，检索只走关键词 + 热度——**不造假向量**。
-  但融合与摘要仍能工作，它们默认跟着**当前会话模型**走，不用你额外配 key。
-
-所以最小可用配置其实是「什么都不填」；想让检索变准，才需要去填 key。
-换过 embed 模型后记得跑一次 `node reindex.mjs`，否则旧条目只能靠关键词命中。
+**要求**：两端都用本插件、`writer` 不同、嵌入模型一致。旧数据不迁移，`layout: "legacy"` 可回退到老的单文件布局。
 
 ---
 
-# 日常怎么用（装好之后）
+## 怎么确认它在工作
 
-**大部分时候你什么都不用做。** 正常聊天就行——插件每轮都会把记忆塞进上下文，模型看到"长期偏好 / 已定的决定 / 硬约束 / 你说记住"这几类信息时会自己调 `memory_write`。
+1. dsh 启动日志里出现：`[memory-tiers] 布局 split · writer=dsh · 嵌入 api:BAAI/bge-m3`
+2. 数据目录里出现 `L1.json`、`L1.tmp/`、`L2/L3.json`、`DL1/DL2/DL3.json`
+3. 聊两轮后 `L1.tmp/dsh.jsonl` 里有内容，`organize.state.json` 有统计
+4. 设置 → 记忆，能看到每层的条数和字数
 
-## 四句话就够
+---
 
-| 你想干什么 | 直接说 |
-|---|---|
-| 让它记住 | 「记住：报告一律用 markdown」 |
-| 让它想起来 | 「我之前说过报告用什么格式？」（它会自己调 `memory_recall`） |
-| 纠正记错的 | 「那条记错了，删掉重记：是 PDF 不是 markdown」 |
-| 看它到底记了什么 | `/memory` |
+## 常见问题
 
-## 怎么确认它真的在工作（三步）
+**Q：token 没降下来？**
 
-1. 在会话里说一句「记住：我的项目路径是 D:/lung」
-2. **开一个新会话**，问「我的项目路径是什么？」——能答出来就说明跨会话生效了
-3. 打开 `~/.dsh/storages/memory-v5/store.json`，能看到那条记录，`layer` 是 `L1`
+先确认三件事：`autoCompact` 是 `true`；`compactKeepTurns` 是 `0`；插件真的在跑（看启动日志）。
+另外缓存是否命中也要看——上下文块**追加在末尾**，前缀不变才省得下来。
 
-## 三个不明显的点
+**Q：它好像没记住我说的话？**
 
-- **`/memory recall 关键词`** 是手动检索，冷存里的东西也能搜到，比问模型快。
-- **冷存不是删除。** L3 的正文在 `archive/*.md` 里躺着，搜到就自动捞回来并升回 L2，你随时能看能改。
-- **重要的东西要钉住。** 说「把那条钉住」，它会调 `memory_pin`，之后无论多久不用都不会被降级——核心偏好和硬性约束值得钉。
+- L1 只注入最新的若干条（按配额），更早的在 L2/DL 里
+- 想让它"永远记得"，说的时候带上明确的意愿（"以后都…"），这类内容更容易被判为重要
+- 检索是按需的：模型得先想到去搜，才会搜
 
-## 它什么时候"遗忘"
+**Q：搜索搜不到？**
 
-- 每 6 小时自动结算一次（插件里的定时器），重启 dsh 也会补结算一次。
-- L1 三天没人碰 → 重要的升 L2，不重要的沉到 `archive/`。
-- L2 三十天没人碰且评分低 → 沉到 `archive/`。
+`search` 有 `depth` 参数：`summary`（只搜摘要）/ `detail`（摘要 + 原文）/ `full`（+ 流水）。
+默认走 `summary`，找不到时换 `full` 再试一次。
 
-想改这些天数，回去改 `memory.mjs` 顶部的 `DEFAULTS`，重启生效。
+**Q：整理很慢，几十秒？**
+
+正常。一次整理要调模型生成摘要，2000 条原文要约 40~140 秒（取决于输出多少）。
+整理在后台跑，不阻塞对话；另一端的整理会等它放钥匙。
+
+**Q：能删掉记忆吗？**
+
+`mem.forget(id)` 会写台账并删除；也可以直接改/删数据目录里的 JSON。删之前先备份。
+
+**Q：换机器怎么办？**
+
+把整个数据目录拷过去，设好 `MEMORY_TIERS_DIR` 指过去即可（配置、记忆、向量都在里面）。
+
+---
+
+## 数据与备份
+
+```
+<数据目录>/
+  L1.json  L2.json  L3.json  DL1.json  DL2.json  DL3.json   ← 六层
+  L1.tmp/<writer>.jsonl                                     ← 各端待合并的当前轮
+  signals/<writer>.jsonl                                    ← attend/pin/forget 请求
+  vectors/deep-part-0000.json                               ← 向量
+  graveyard/forgotten.jsonl                                 ← 遗忘台账
+  config.json                                               ← 配置
+  organize.lock                                             ← 整理时的锁（正常情况下不存在）
+```
+
+备份就拷整个目录。想彻底重来，删掉目录、重启，会重新生成。
+
+---
+
+## 开发者
+
+> 下面这些脚本只在仓库里，npm 包里不含（`files` 字段只带运行时文件）。
+
+```bash
+node test-memory6.mjs      # 六文件布局，66 项
+node test-m5.mjs           # legacy 回归，41 项
+node test-batch.mjs        # 批量写入，20 项
+node test-share.mjs        # 多写者分片，25 项
+node sim-real.mjs          # 真实模型仿真（九组机制，--dry 假模型不花钱）
+node bench-scale.mjs sum   # 摘要规模基准（会花真钱）
+```
+
+设计、实测数据、已知问题、待办：全部在 [`ARCHITECTURE.md`](./ARCHITECTURE.md)。
+改代码前先读那一份，本文为了好读省略了大量约束。
+
+## License
+
+MIT

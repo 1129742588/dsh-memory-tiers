@@ -1910,7 +1910,7 @@ function stage(name) {
 
 ```json
 {
-  "apiKey": "sk-siliconflow",
+  "apiKey": "<你的硅基流动 Key>",
   "apiBase": "https://api.siliconflow.cn/v1",
   "models": {
     "summary": {

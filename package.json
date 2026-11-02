@@ -1,7 +1,7 @@
 {
   "name": "dsh-memory-tiers",
-  "version": "0.8.0",
-  "description": "六层记忆插件：L1/L2/L3 活跃层 + DL1/DL2/DL3 深层，自动捕获写入、摘要沉淀、按需召回，并接管历史压缩（零 LLM）。",
+  "version": "0.8.1",
+  "description": "给 dsh 加长期记忆，并把每轮 token 压住不涨：自动记住对话、按需检索、接管历史压缩（零 LLM）。",
   "type": "module",
   "main": "index.mjs",
   "license": "MIT",
