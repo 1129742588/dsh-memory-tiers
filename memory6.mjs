@@ -67,7 +67,6 @@ export const DEFAULTS6 = {
 }
 
 const DATA_LAYERS = ['L1', 'L2', 'DL1', 'DL2', 'DL3']
-const DEEP_LAYERS = ['DL1', 'DL2', 'DL3']
 const ALL_LAYERS = ['L1', 'L2', 'L3', 'DL1', 'DL2', 'DL3']
 
 const sanitizeWriter = (w) =>
@@ -430,22 +429,24 @@ export function createMemory6(o = {}) {
     return out
   }
 
-  function deepIdSet() {
-    const s = new Set()
-    for (const l of DEEP_LAYERS) {
-      try { for (const it of readLayer(l)) s.add(it.id) } catch { /* 损坏的层由调用方降级 */ }
-    }
-    return s
-  }
-
-  function readL1View() {
+  /**
+   * L1 视图 = 真 L1 + 所有 temp，按 id 去重。
+   *
+   * ★ 不再自己读 DL1/DL2/DL3 做"已下沉"比对（2026-11-02）。
+   *   原来每轮注入都要全量解析三个深层文件——DL1 上千条时是 10~30ms 的同步 IO，
+   *   Node 单线程，这段时间整个进程是卡住的。而正常流程下 L1 根本不含深层条目：
+   *   `saveDb` 特意"先写目标层、最后写 L1"，`reconcile` 整理时还会再对一次账。
+   *   只有崩溃后才可能出现交叉，那时重复显示一条（不是丢），下一次整理就清掉。
+   *
+   * @param {{placed?: Set<string>}} [opts] 已确认在别的层里的 id（调用方手上有就传，
+   *   比如 buildBlock 已经读过 L2，顺手给出，不用再读一次）
+   */
+  function readL1View({ placed = null } = {}) {
     const temp = readTempsAll()
     const base = (() => { try { return readLayer('L1') } catch { return [] } })()
     const all = dedupe([...base, ...temp.items])
-    // 已经进了 L2 / 深层的东西，不再当"刚发生的"重复注入
-    const placed = deepIdSet()
     try { for (const it of readLayer('L2')) placed.add(it.id) } catch { /* 忽略 */ }
-    return { items: all.filter((it) => !placed.has(it.id)), bad: temp.bad }
+    return { items: placed ? all.filter((it) => !placed.has(it.id)) : all, bad: temp.bad }
   }
 
   // ============================================================
@@ -520,22 +521,30 @@ export function createMemory6(o = {}) {
    * 顺带保证"同一事件只存在一层"。
    */
   function reconcile(db) {
+    // 返回"清掉了多少条"。调用方用它决定要不要落盘——不返回的话，
+    // 崩溃残留的交叉条目虽然被清出内存了，却可能因为"本轮没有别的变化"而写不回去。
+    let removed = 0
     const deep = new Map()
     for (const l of ['DL3', 'DL2', 'DL1']) {
+      const before = db[l].length
       db[l] = dedupe(db[l])
+      removed += before - db[l].length
       for (const it of db[l]) if (!deep.has(it.id)) deep.set(it.id, l)
     }
+    const l1Before = db.L1.length
     db.L1 = dedupe(db.L1).filter((it) => !deep.has(it.id))
+    const l2Before = db.L2.length
     db.L2 = dedupe(db.L2).filter((it) => !deep.has(it.id))
     // 已经进了 L2 的，也不能还留在 L1（崩在"L2 写完、L1 没改"时会这样）
     const inL2 = new Set(db.L2.map((it) => it.id))
     db.L1 = db.L1.filter((it) => !inL2.has(it.id))
+    removed += (l1Before - db.L1.length) + (l2Before - db.L2.length)
 
     // 同一个 id 出现在两个深层：保留更靠后的（DL2 > DL1；DL3 只放摘要，理论上不会撞）
     const seen = new Set()
     for (const l of ['DL3', 'DL2', 'DL1']) {
       db[l] = db[l].filter((it) => {
-        if (seen.has(it.id)) { audit(`RECONCILE_DUP ${it.id} ${l}`); return false }
+        if (seen.has(it.id)) { audit(`RECONCILE_DUP ${it.id} ${l}`); removed++; return false }
         seen.add(it.id)
         return true
       })
@@ -555,8 +564,9 @@ export function createMemory6(o = {}) {
         db.DL1.push(it)
       }
       audit(`RECONCILE_DL2_ORPHAN ${orphans.length} 条 → DL1（DL2 只放被引用的原文）`)
+      removed += orphans.length      // 不算丢，只是换层；但文件确实变了，要写回
     }
-    return deep.size
+    return removed
   }
 
   function sortDb(db) {
@@ -1021,7 +1031,10 @@ export function createMemory6(o = {}) {
     let claimed = []
     try {
       const db = loadDb()
-      reconcile(db)
+      // 整理时对账（注入路径不再做这件事，见 readL1View 的说明）：
+      // 清理崩溃留下的跨层交叉、DL2 孤儿。清掉的条目要能写回去，
+      // 所以这里记下条数，最后并进 changed。
+      const rec1 = reconcile(db)
       // DL3 的内容快照：用来判断"这轮到底动没动摘要"，没动就别重写文件。
       // 重写会让 mtime 变、让 L3 快照被判过期，白白打断一次前缀缓存。
       const dl3Before = JSON.stringify(db.DL3)
@@ -1031,7 +1044,7 @@ export function createMemory6(o = {}) {
       // 先消费信号：attend 可能把 DL1 升回 L2，别让 L2 摘要先把这条吃掉。
       const sg = applySignals(db)
       // 信号可能刚删了摘要；再对一次账，DL2 孤儿同轮就归位到 DL1。
-      reconcile(db)
+      const rec2 = reconcile(db)
       checkTimeout(started)
       const n1 = await organizeL1(db, started)
       checkTimeout(started)
@@ -1041,7 +1054,8 @@ export function createMemory6(o = {}) {
       checkLock()          // 卡太久可能被接管；不是我的钥匙就不许写
       // ★ 没变化就不落盘：turn/end 之后每轮都会调一次 organize，
       //   无条件写五个文件会把"每轮尝试整理"变成"每轮全量重写"。
-      const changed = m.merged > 0 || (sg?.ops || 0) > 0 || n1 > 0 || n2 > 0 || nf > 0
+      const changed = m.merged > 0 || (sg?.ops || 0) > 0 || n1 > 0 || n2 > 0 || nf > 0 ||
+        rec1 > 0 || rec2 > 0
       if (changed) {
         const dl3Changed = JSON.stringify(db.DL3) !== dl3Before
         saveDb(db, { skip: dl3Changed ? [] : ['DL3'] })
@@ -1121,9 +1135,11 @@ export function createMemory6(o = {}) {
     let l3 = readL3Snapshot()
     if (l3 === null) l3 = computeL3(null)
     l3 = l3.filter((it) => !it.supersededBy)
-    let l2 = []
-    try { l2 = readLayer('L2').filter((it) => !it.supersededBy) } catch { l2 = [] }
-    const l1r = readL1View()
+    // L2 只读一次：既用来拼"最近沉淀的"，顺手当"已下沉"的 id 集合给 L1 视图去重
+    let l2raw = []
+    try { l2raw = readLayer('L2') } catch { l2raw = [] }
+    const l2 = l2raw.filter((it) => !it.supersededBy)
+    const l1r = readL1View({ placed: new Set(l2raw.map((it) => it.id)) })
     const l1 = l1r.items.filter((it) => !it.supersededBy)
 
     l2.sort((a, b) => ((a.consolidatedAt ?? a.createdAt) - (b.consolidatedAt ?? b.createdAt)) || cmpId(a.id, b.id))

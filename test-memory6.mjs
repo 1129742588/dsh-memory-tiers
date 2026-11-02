@@ -368,6 +368,30 @@ console.log('⑭ 没变化时 organize 不重写文件')
   rmSync(I, { recursive: true, force: true })
 }
 
+// ============================================================
+console.log('⑮ 注入不依赖深层文件（不再全量读 DL1/DL2/DL3）')
+// ============================================================
+{
+  const K = '.test-m6-inject'
+  rmSync(K, { recursive: true, force: true })
+  mode = 'citeAll'
+  const a = mk(K, 'dsh')
+  a.writeTurn([
+    { text: '爬山' + 'x'.repeat(120), speaker: 'user', channel: 'dialog', turnId: 'i1' },
+    { text: '爬山回来' + 'y'.repeat(120), speaker: 'bot', channel: 'dialog', turnId: 'i1' },
+  ])
+  await a.organize()
+  // 把深层文件写坏：如果注入还去读它们，就会解析失败或内容丢失
+  writeFileSync(`${K}/DL1.json`, '{坏掉的 json')
+  writeFileSync(`${K}/DL2.json`, '{坏掉的 json')
+  let block = ''
+  let threw = null
+  try { block = a.buildBlock() } catch (e) { threw = e }
+  ok('深层文件坏了也不抛错', !threw, String(threw))
+  ok('注入仍然有内容（只靠 L1/L2/L3）', block.length > 0, String(block.length))
+  rmSync(K, { recursive: true, force: true })
+}
+
 rmSync('.test-m6', { recursive: true, force: true })
 rmSync('.test-m6-sig', { recursive: true, force: true })
 rmSync('.test-m6-l2', { recursive: true, force: true })
