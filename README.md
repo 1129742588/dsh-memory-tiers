@@ -36,18 +36,17 @@ dsh 聊久了会遇到两种结局：要么历史太长塞不下，要么被自�
 
 ## 安装
 
-**方式一：dsh 插件市场**（推荐）
-
-在 dsh 的插件市场里搜 `dsh-memory-tiers`，安装后重启。
-
-**方式二：npm**
+**方式一：一条命令**（推荐）
 
 ```bash
-cd ~/.dsh/profiles/desktop
-pnpm add dsh-memory-tiers
+dsh plugin --profile web add dsh-memory-tiers
 ```
 
-然后把 `dsh-memory-tiers` 加进该 profile `package.json` 的 `dsh.profile.bundles`，重启 dsh。
+装完重启 dsh。
+
+**方式二：dsh 插件中心**
+
+在 dsh 里打开「插件中心」，搜 `dsh-memory-tiers`，点安装，然后重启。
 
 **方式三：本地链接**（改代码时用）
 
