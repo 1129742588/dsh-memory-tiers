@@ -1,0 +1,56 @@
+{
+  "name": "dsh-memory-tiers",
+  "version": "1.2.0",
+  "description": "dsh 的六层本地记忆：每轮收进 L1，安静后分流成摘要与原文档，长期层注入上下文，并用记忆替代对话历史。",
+  "type": "module",
+  "main": "index.mjs",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "memory",
+    "context"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/1129742588/dsh-memory-tiers.git"
+  },
+  "homepage": "https://github.com/1129742588/dsh-memory-tiers#readme",
+  "bugs": {
+    "url": "https://github.com/1129742588/dsh-memory-tiers/issues"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "inject": [],
+      "platform": "web"
+    }
+  },
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./client.mjs",
+    "./memory": "./memory.mjs",
+    "./llm": "./llm.mjs",
+    "./settings": "./settings.mjs",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "index.mjs",
+    "memory.mjs",
+    "llm.mjs",
+    "settings.mjs",
+    "client.mjs",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test ../test/memory.test.mjs ../test/config.test.mjs ../test/flow.test.mjs"
+  }
+}
