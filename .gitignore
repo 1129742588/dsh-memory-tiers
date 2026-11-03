@@ -1,15 +1,4 @@
-# 依赖
 node_modules/
-
-# 临时产物（不进包、不进仓库）
-scratch/
-*.tmp
-*.log
-
-# 系统
 .DS_Store
-Thumbs.db
-
-test/
-tools/
-docs/
+/.dsh/
+*.log

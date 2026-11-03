@@ -1,0 +1,5 @@
+# 这一行告诉 dsh：装载这个包时，把它插进配置树。
+# id 可以自取（全小写），name 必须和 package.json 里的 name 完全一致，否则加载失败。
+- insert:
+    - id: memory-tiers
+      name: dsh-memory-tiers
