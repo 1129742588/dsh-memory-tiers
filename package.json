@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-tiers",
-  "version": "0.8.3",
+  "version": "0.8.4",
   "description": "让 dsh 记住你说过的话，忘掉无关的，聊再久也不多花钱。",
   "type": "module",
   "main": "index.mjs",

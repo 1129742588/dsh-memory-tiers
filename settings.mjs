@@ -43,6 +43,17 @@ function pointerFile() {
   return join(home, 'memory-tiers.json')
 }
 
+/** 指针文件里「已保存的目标目录」，空串 = 没设过（用默认目录）。
+ *  回显必须用它而不是进程正在用的目录：改目录要重启才生效，
+ *  要是回显运行目录，保存完一刷新就「弹回 memory-v5」，看起来像没保存（踩过）。 */
+export function readPointerDir() {
+  try {
+    const raw = JSON.parse(readFileSync(pointerFile(), 'utf8'))
+    const v = raw && typeof raw.dir === 'string' ? raw.dir.trim() : ''
+    return v || ''
+  } catch { return '' }
+}
+
 /** 关思考：chat（融合判关系）默认 true，summary 默认 false */
 const NOTHINK_WRITABLE = { chat: 'boolean', summary: 'boolean' }
 
@@ -162,8 +173,10 @@ export function installSettingsApi(ctx, opts) {
         ok: true,
         config: {
           ...file,
-          // dir 不在 config.json 里（它在数据目录里面，鸡生蛋），从指针文件回填给界面
-          dir: live.dir || dir,
+          // dir 不在 config.json 里（鸡生蛋）。回显「已保存的目标目录」（指针文件），
+          // 不是进程正在用的目录——进程目录要重启才换，回显它会显得保存没生效。
+          // 想看进程实际在用哪个，看下面 live.dir（界面上的「当前生效目录」）。
+          dir: readPointerDir() || dir,
           writer: file.writer || 'default',
           memoryCfg: { ...(file.memoryCfg || {}) },
         },

@@ -13,6 +13,7 @@ import { readFileSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { migrateTimeUnits } from '../core/index.mjs'
+import { readPointerDir } from '../core/settings.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const CORE = join(dirname(HERE), 'core')
@@ -98,10 +99,25 @@ ok(/organizeEveryMin:\s*5/.test(idxSrc), 'index.mjs 应默认 organizeEveryMin: 
 ok(/refreshMin:\s*30/.test(idxSrc), 'index.mjs 应默认 refreshMin: 30')
 ok(/semanticTtlMin:\s*3/.test(idxSrc), 'index.mjs 应默认 semanticTtlMin: 3')
 
+// ── 5. dir 回显读指针文件（踩过：回显进程目录，保存完一刷新「弹回 memory-v5」）──
+const osHome = await import('node:os')
+const prevHome = process.env.DSH_HOME
+process.env.DSH_HOME = await import('node:fs').then((f) => f.mkdtempSync(join(osHome.tmpdir(), 'dmt-test-')))
+ok(readPointerDir() === '', '没写指针文件时 readPointerDir 应为空串')
+{
+  const fs = await import('node:fs')
+  fs.writeFileSync(join(process.env.DSH_HOME, 'memory-tiers.json'),
+    JSON.stringify({ dir: 'D:/shared/memory' }), 'utf8')
+  ok(readPointerDir() === 'D:/shared/memory', 'readPointerDir 应读出指针文件里已保存的目录')
+  fs.writeFileSync(join(process.env.DSH_HOME, 'memory-tiers.json'), '不是JSON', 'utf8')
+  ok(readPointerDir() === '', '指针文件损坏时应回落空串而不是抛错')
+}
+if (prevHome === undefined) delete process.env.DSH_HOME; else process.env.DSH_HOME = prevHome
+
 // ── 结果 ──
 if (errs.length) {
   console.error('配置自检失败：')
   for (const e of errs) console.error('  ✗ ' + e)
   process.exit(1)
 }
-console.log(`配置自检通过：迁移 4 例，字段对齐 ${checked} 项，默认值 6 项`)
+console.log(`配置自检通过：迁移 4 例，字段对齐 ${checked} 项，默认值 6 项，dir 回显 3 例`)
