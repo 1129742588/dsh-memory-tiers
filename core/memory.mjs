@@ -1997,25 +1997,19 @@ export function createMemory(o = {}) {
     const longLines = pack(l3, Infinity)
     const consLines = pack(l2, cfg.consolidateMaxChars)
 
-    // L1：自己端全量注入，不再装箱截断。
-    //   原因：分流机制（纯字数溢出）已保证 L1 水位（分流后 ≤ cap/2），而注入配额是
-    //   「行渲染」口径（每行带时间戳/来源前缀，比 text 膨胀约 30%），水位必然阶段性
-    //   超过配额 → 装箱截断 → 滑动窗口 → 每轮前缀断裂（实测未命中 1700）。
-    //   「另一端」来源没有分流保证，保留配额防爆。
-    const cap = cfg.hotMaxChars
-    // 注：旧版这里按 hotQuotaOwn 给自己端设注入配额，1.2.0 起自己端全量注入
-    //（大小由分流机制保证），该系数已无生效点，配置项一并移除。
-    const mine = l1.filter((it) => it.origin === writer).map((it) => lineOf(it))
-    const mineUsed = mine.reduce((s, l) => s + l.length + 1, 0)
-    const byNewest = (list) => [...list].sort((a, b) => (b.createdAt - a.createdAt) || cmpId(b.id, a.id))
-    const other = pack(byNewest(l1.filter((it) => it.origin !== writer)), Math.max(0, cap * 1.5 - mineUsed)).reverse()
+    // L1：全部条目（不分端）统一按时间升序渲染，全量注入、无装箱。
+    //   原因一（水位）：分流机制（纯字数溢出）已保证 L1 水位（分流后 ≤ cap/2），
+    //   注入配额是「行渲染」口径（每行带前缀膨胀约 30%），水位必然阶段性超过配额
+    //   → 装箱截断 → 滑动窗口 → 前缀断裂（实测未命中 1700）。
+    //   原因二（分端）：按 origin 拆 mine/other 两个子段顺序拼接，只要自己端有新行
+    //   就会把另一端的行整体顶后 → 同样前缀断裂（实测复现 1700）。
+    //   结论：单一时间轴 + 纯尾部追加，是前缀缓存的唯一稳定形态。
+    const histLines = l1.map((it) => lineOf(it))
 
     const parts = []
     if (longLines.length) parts.push('## 一直记得的', ...longLines)
     if (consLines.length) parts.push('## 最近沉淀的', ...consLines)
-    if (mine.length || other.length) parts.push('## 这是按时间排序的历史对话', ...mine, ...other)
-    const shown = mine.length + other.length
-    if (shown < l1.length) parts.push(`（即时层还有 ${l1.length - shown} 条未显示）`)
+    if (histLines.length) parts.push('## 这是按时间排序的历史对话', ...histLines)
     // 提示语和相关旧事只在**真的有记忆内容**时才追加：
     // 记忆库空的时候不能给模型一句「历史已被替代」——那会让它以为有记忆可查，
     // 而实际什么都没有（压缩前的「记忆块非空」守卫也依赖这一点）。

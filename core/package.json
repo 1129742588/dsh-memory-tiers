@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-tiers",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "dsh 的六层本地记忆：每轮收进 L1，安静后分流成摘要与原文档，长期层注入上下文，并用记忆替代对话历史。",
   "type": "module",
   "main": "index.mjs",
