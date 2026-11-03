@@ -1,6 +1,6 @@
 {
   "name": "dsh-memory-tiers",
-  "version": "0.8.2",
+  "version": "0.8.3",
   "description": "让 dsh 记住你说过的话，忘掉无关的，聊再久也不多花钱。",
   "type": "module",
   "main": "index.mjs",
@@ -33,8 +33,7 @@
     ".": "./index.mjs",
     "./client": "./client.mjs",
     "./compaction.mjs": "./compaction.mjs",
-    "./memory5.mjs": "./memory5.mjs",
-    "./memory6.mjs": "./memory6.mjs",
+    "./memory.mjs": "./memory.mjs",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json",
     "./dshllm.mjs": "./dshllm.mjs"
@@ -44,20 +43,19 @@
     "client.mjs",
     "settings.mjs",
     "compaction.mjs",
-    "memory5.mjs",
-    "memory6.mjs",
+    "memory.mjs",
     "silicon.mjs",
     "cordis.patch.yml",
     "README.md",
     "ARCHITECTURE.md",
-    "reindex.mjs",
     "dshllm.mjs"
   ],
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "reindex": "node reindex.mjs",
-    "test:m6": "node test-memory6.mjs"
+    "test:memory": "node ../test/test_fuse_vector.mjs",
+    "test:config": "node ../test/test_config.mjs",
+    "test": "node ../test/test_config.mjs"
   }
 }

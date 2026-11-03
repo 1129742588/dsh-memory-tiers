@@ -213,6 +213,9 @@ const CLASSIFY_SYS = [
   '  dialog = 说了一段话，重点在话本身。他说他最怕漏诊、我吐槽像年糕、聊到爬山。',
   '  event  = 外面发生的事，不是自己主动做的。刷到一条视频、看到有人吵架、路上被撞、群里出事。',
   '  分不清 action 和 event 时：自己动手 = action，外面发生的 = event。都不像就选 dialog。',
+  '  别人说的话（转述、要求、抱怨、答应）都算 dialog，哪怕内容是命令——',
+  '  「老王说周五之前必须交报告」是 dialog，不是 event。',
+  '  event 只用于「没人说、自己也没做，就是发生了」的事：刷到视频、路上被撞。',
   '',
   'importance 三档：0.85 定原则或长期诉求；0.6 有结果的具体事件；0.25 闲聊琐事。',
   '',
@@ -251,6 +254,9 @@ const CLASSIFY_BATCH_SYS = [
   '  dialog = 说了一段话，重点在话本身。他说他最怕漏诊、我吐槽像年糕、聊到爬山。',
   '  event  = 外面发生的事，不是自己主动做的。刷到视频、看到吵架、路上被撞。',
   '  分不清 action 和 event 时：自己动手 = action，外面发生的 = event。都不像就选 dialog。',
+  '  别人说的话（转述、要求、抱怨、答应）都算 dialog，哪怕内容是命令——',
+  '  「老王说周五之前必须交报告」是 dialog，不是 event。',
+  '  event 只用于「没人说、自己也没做，就是发生了」的事：刷到视频、路上被撞。',
   '',
   'importance 三档：0.85 定原则或长期诉求；0.6 有结果的具体事件；0.25 闲聊琐事。',
   '',
@@ -580,6 +586,9 @@ export function createSilicon(options = {}) {
       hint ? `要求：${hint}` : '',
       focus,
       '保留人名和具体数字。不许写原文里没有的事。',
+      '原文行首的 [月-日] 是这一条发生的时间。原文里的「今天/明天/昨天/下周/上周三」' +
+      '要按那个日期折算成具体日期再写进摘要（例如 10-30 说的「明天」写成「10-31」）；' +
+      '原文里已有的日期照抄。摘要里不要出现「今天」这种离开原文就看不懂的词。',
       // 这条是防"一堆话不知道谁说的"的关键：
       // 摘要最怕把"张三说要爬山"压成"聊了爬山"，那这条记忆就废了
       folks.length
@@ -681,6 +690,9 @@ export function createSilicon(options = {}) {
       hint ? `要求：${hint}` : '',
       focus,
       '保留人名和具体数字。不许写原文里没有的事。',
+      '原文行首的 [月-日] 是这一条发生的时间。原文里的「今天/明天/昨天/下周/上周三」' +
+      '要按那个日期折算成具体日期再写进摘要（例如 10-30 说的「明天」写成「10-31」）；' +
+      '原文里已有的日期照抄。摘要里不要出现「今天」这种离开原文就看不懂的词。',
       folks.length
         ? `这批里出现过的人：${folks.join('、')}。摘要里写到具体的事，必须带上是谁说的/谁做的。`
         : '原文里如果有人名，摘要里也要留着。',
@@ -708,7 +720,7 @@ export function createSilicon(options = {}) {
       '+ 2,7',
       '',
       '三个符号的区别：',
-      '  ★ 特别重要 —— 原则、命令、长期承诺、关键结果、"以后一律…"。必须长期记住。',
+      '  ★ 特别重要 —— 原则、命令、长期承诺、关键结果、「以后一律…」。必须长期记住。',
       '  · 一般重要 —— 有信息量的日常，记着有好处，但不强制。',
       '  + 不用写摘要 —— 有信息量、值得留着以后查的（约定、数字、人名、时间地点）。',
       '',
@@ -778,11 +790,6 @@ export function createSilicon(options = {}) {
     const body = String(text || '').trim()
     if (!body) return null
 
-    // 先过本地规则：模型判反的典型，规则更稳也更省
-    if (LOW_PATTERNS.test(body) && !HIGH_PATTERNS.test(body)) {
-      return { importance: 0.25, channel: /跑通|完成|删|改|部署|提交/.test(body) ? 'action' : 'dialog', by: 'rule' }
-    }
-
     try {
       const out = await chat(CLASSIFY_SYS, `记忆：${body}`, { maxTokens: 300 })
       const j = parseJson(out)
@@ -822,21 +829,14 @@ export function createSilicon(options = {}) {
     const list = (texts || []).map((t) => String(t || '').trim())
     const out = new Array(list.length).fill(null)
 
-    // ① 本地规则先过
+    // ① 全部交给模型。
+    //
+    //   ★ 2026-11-02 去掉本地预筛：原来「今天有点困」这类会被规则直接判 0.25
+    //     而根本不问模型，于是同一批里一部分是模型判的、一部分是正则判的，
+    //     出问题时根本分不清是谁判错的。分类是模型该干的活，规则只留在
+    //     「模型不可用时的临时标记」（localTag + impRough），不产生最终标签。
     const need = []
-    for (let i = 0; i < list.length; i++) {
-      const b = list[i]
-      if (!b) continue
-      if (LOW_PATTERNS.test(b) && !HIGH_PATTERNS.test(b)) {
-        out[i] = {
-          importance: 0.25,
-          channel: /跑通|完成|删|改|部署|提交/.test(b) ? 'action' : 'dialog',
-          by: 'rule',
-        }
-      } else {
-        need.push(i)
-      }
-    }
+    for (let i = 0; i < list.length; i++) if (list[i]) need.push(i)
     if (!need.length) return out
 
     // ② 分组问模型
@@ -851,11 +851,13 @@ export function createSilicon(options = {}) {
         })
         const arr = parseJson(raw)
         if (!Array.isArray(arr)) continue      // 这一组失败，保持 null
+        const hasI = arr.some((x) => x && typeof x === 'object' && 'i' in x)
 
         for (let k = 0; k < idx.length; k++) {
           const i = idx[k]
-          // 优先按 i 对齐，没有 i 就按位置
-          const item = arr.find((x) => Number(x?.i) === k + 1) || arr[k]
+          // 有 i 就严格按 i 对齐；**不能**在缺项时退回按位置——
+          // 漏了第 2 项却拿第 3 项的标签顶上，等于把两件事的记忆互相污染。
+          const item = hasI ? arr.find((x) => Number(x?.i) === k + 1) : arr[k]
           if (!item) continue
 
           let importance = Number(item.importance)

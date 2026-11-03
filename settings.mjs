@@ -15,15 +15,17 @@ const WRITABLE = {
   apiKey: 'string',
   apiBase: 'string',
   bootMaxChars: 'number',
-  refreshMinMs: 'number',   // L3 视图（DL3 排序）刷新间隔；L1/L2 不节流
+  inject: 'boolean',        // 注入总开关：false = 只写不读
+  refreshMin: 'number',     // L3 视图（DL3 排序）刷新间隔（分钟）；L1/L2 不节流
+  semanticTtlMin: 'number', // 语义检索结果的有效期（分钟）
   autoCompact: 'boolean',
   compactKeepTurns: 'number',
   compactArchiveChars: 'number',
   userCaptureChars: 'number',
   toolCaptureChars: 'number',
   botCaptureChars: 'number',   // 一轮 assistant 正文拼起来后截多少（L1 当最近历史用）
-  quietMs: 'number',           // 安静多久才允许整理 L1
-  organizeEveryMs: 'number',   // 整理定时器
+  quietMin: 'number',          // 安静多少分钟才允许整理 L1
+  organizeEveryMin: 'number',  // 整理定时器（分钟）
   budgetTokens: 'number',
   flushEveryMs: 'number',
   sweepEveryMs: 'number',
@@ -50,6 +52,11 @@ const MEMORY_CFG_WRITABLE = {
   consolidateMaxChars: 'number',
   longMaxChars: 'number',
   dl2MaxChars: 'number',
+  // 下面几项和 astrbot 端的配置项一一对应（hot_quota_own / l2_keep_max / summary_chunk / forget_threshold）
+  hotQuotaOwn: 'number',
+  l2KeepMax: 'number',
+  summaryChunk: 'number',
+  forgetThreshold: 'number',
 }
 
 /** 每个模型阶段可单独覆盖的连接参数；留空字符串 = 清除覆盖、回落到顶层 */
@@ -193,6 +200,7 @@ export function installSettingsApi(ctx, opts) {
           last: stats?.last ?? null,
           semantic: !!(live.apiKey || process.env.SILICONFLOW_API_KEY ||
             Object.values(live.models || {}).some((m) => m?.apiKey)),
+          inject: live.inject !== false,
           autoCompact: live.autoCompact !== false,
           preset: live.preset || 'siliconflow',
           noThink: { chat: true, summary: false, ...(file.noThink || {}) },

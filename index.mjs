@@ -1,7 +1,7 @@
 /**
  * dsh 插件适配层 —— 接 memory5（六层记忆）。只干"接线"，不含记忆逻辑。
  *
- * v1（memory.mjs）→ v5（memory5.mjs）的四个接入口：
+ * 单文件合并（memory.mjs）之后，四个接入口没变：
  *   ① 写：订阅 session/event，turn 结束时把这一轮合成记忆（自动，不靠模型自觉）
  *   ② 读：systemPrompt.section 注入 buildBlock（L3 视图 + L2 + L1）
  *   ③ 查：memory_search / memory_attend 工具（搜到不涨热度，确认才涨）
@@ -19,8 +19,11 @@
 import { homedir } from 'node:os'
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync } from 'node:fs'
 import { join } from 'node:path'
-import { createMemory5, LAYER, DEFAULTS as MEM_DEFAULTS } from './memory5.mjs'
-import { createMemory6, DEFAULTS6 as MEM6_DEFAULTS } from './memory6.mjs'
+import {
+  createMemory, createLegacyMemory, LAYER,
+  DEFAULTS_LEGACY as MEM_LEGACY_DEFAULTS,
+  DEFAULTS_SPLIT as MEM_SPLIT_DEFAULTS,
+} from './memory.mjs'
 import { createSilicon, keyFromAstrbot } from './silicon.mjs'
 import { compactSurface } from './compaction.mjs'
 import { installSettingsApi } from './settings.mjs'
@@ -52,17 +55,62 @@ const PLUGIN_DEFAULTS = {
   toolCaptureChars: 500,      // 工具输出截断（bash 一次能吐几万字，L1 才 3000 字）
   // 一轮会话里 assistant 的正文：拼起来再截断（不是每条消息截）。L1 要靠它当"最近历史"。
   botCaptureChars: 400,
+  // ── 相关旧事（与 astrbot 的 semantic_inject 对齐）──
+  // 开启后每轮用你的话做一次语义检索，命中的旧记忆拼成「## 相关的旧事」附在注入块末尾。
+  // 代价是每轮多一次 embedding 调用。默认关。
+  semanticInject: false,
+  semanticTopK: 5,             // 最多拼几条
+  semanticMinSim: 0.35,        // 相似度下限，低于这个不拼（避免字面擦边）
+  semanticTtlMin: 3,           // 检索结果的有效期（分钟，超时不用，避免注入隔夜的话题）
   // split 布局：一段会话结束后，隔这么久没新消息才允许整理（避免聊到一半被摘要腰斩）
-  quietMs: 10 * 60 * 1000,
-  organizeEveryMs: 5 * 60 * 1000,   // 整理触发：端结束 + 这个定时器补漏
+  quietMin: 10,
+  organizeEveryMin: 5,         // 整理触发：端结束 + 这个定时器补漏
+  // 注入总开关：关掉只写不读（先验证写入是否正常时用）
+  inject: true,
   // L1/L2/L3 恒定注入，没有开关——三层就是上下文的全部「记忆」，可调的是各自容量。
-  refreshMinMs: 30 * 60 * 1000, // L3 视图（DL3 按热度×档位排序）的重算间隔。
+  refreshMin: 30,              // L3 视图（DL3 按热度×档位排序）的重算间隔（分钟）
   //   L1/L2 不节流，每轮现算并追加在末尾；只有 L3 排在注入块最前，它一动后面缓存全断。
+  // 下面两个是内部维护定时器，不进设置页，仍用毫秒。
   flushEveryMs: 5 * 60 * 1000,
   sweepEveryMs: 6 * 60 * 60 * 1000,
   autoCompact: true,          // 每轮结束把 dsh 自带历史压成一条占位（零 LLM）
   compactKeepTurns: 0,        // 0 = 完全取替 dsh 会话历史（L1 里已经有历史了）
   compactArchiveChars: 1200,  // 每轮压缩归档进记忆的字数上限
+}
+
+/**
+ * 老的毫秒键 → 新的分钟键。
+ *
+ * v0.8 之前时间类配置叫 quietMs / organizeEveryMs / refreshMinMs / semanticTtlMs，
+ * 单位毫秒，值大（600000）且容易少填或多填一个 0。现在统一用分钟（quietMin = 10），
+ * 和 astrbot 那边的 quiet_min / organize_every_min 对得上，抄配置不用换算。
+ * 只在读的时候换算一次：> 1000 当毫秒处理（没人会把 10 分钟填成 10000 分钟）。
+ */
+const MS_TO_MIN = {
+  quietMs: 'quietMin',
+  organizeEveryMs: 'organizeEveryMin',
+  refreshMinMs: 'refreshMin',
+  semanticTtlMs: 'semanticTtlMin',
+}
+
+export function migrateTimeUnits(cfg) {
+  const out = { ...cfg }
+  for (const [oldKey, newKey] of Object.entries(MS_TO_MIN)) {
+    if (!(oldKey in out)) continue
+    const n = Number(out[oldKey])
+    if (out[newKey] === undefined && Number.isFinite(n) && n >= 0) {
+      out[newKey] = n >= 1000 ? Math.round(n / 60000) : n
+    }
+    delete out[oldKey]
+  }
+  return out
+}
+
+/** 分钟 → 毫秒；0 / 负数 / 非法值回落到给定的毫秒默认 */
+function minutesToMs(v, dfltMs) {
+  const n = Number(v)
+  if (!Number.isFinite(n) || n <= 0) return dfltMs
+  return n * 60000
 }
 
 /** 数据放哪：优先 DSH_HOME，否则 ~/.dsh。v5 用独立目录，别和 v1 的 store 混。 */
@@ -220,7 +268,7 @@ function takeText(blocks) {
 export function apply(ctx, config = {}) {
   const baseDir = config.dir || defaultDir()
   // 优先级：默认值 < config.json < 调用方传入 config
-  const cfg = { ...PLUGIN_DEFAULTS, ...loadFileConfig(baseDir), ...config }
+  const cfg = migrateTimeUnits({ ...PLUGIN_DEFAULTS, ...loadFileConfig(baseDir), ...config })
   const log = ctx.logger ?? console
   const dir = baseDir
 
@@ -245,14 +293,16 @@ export function apply(ctx, config = {}) {
         userCaptureChars: 2000,
         toolCaptureChars: 500,
         botCaptureChars: 400,          // 一轮回复拼起来后截断（L1 要当最近历史用）
-        quietMs: 600000,               // 安静 10 分钟才允许整理 L1（别腰斩正在聊的对话）
-        organizeEveryMs: 300000,       // 整理定时器：5 分钟补一轮
+        inject: true,                  // 注入总开关：false = 只写不读
+        quietMin: 10,                  // 安静 10 分钟才允许整理 L1（别腰斩正在聊的对话）
+        organizeEveryMin: 5,           // 整理定时器：5 分钟补一轮
         budgetTokens: 0,
-        refreshMinMs: 1800000,         // L3 快照刷新间隔，见 _说明
+        refreshMin: 30,                // L3 快照刷新间隔（分钟），见 _说明
         autoCompact: true,
         compactKeepTurns: 0,           // 0 = dsh 历史一条不留，全交给记忆（L1 就是历史）
         compactArchiveChars: 1200,
-        memoryCfg: { longMaxChars: 4000, hotMaxChars: 3000 },
+        semanticTtlMin: 3,             // 语义检索结果的有效期（分钟），超时重算
+        memoryCfg: { longMaxChars: 3000, hotMaxChars: 3000, consolidateMaxChars: 2500 },
         // 每个模型阶段可单独覆盖。两种来源：
         //   source: 'session' —— 走 dsh 当前会话模型（对话用 flash 就 flash，不用额外 key）
         //   { base, apiKey, model } —— 走外部 provider
@@ -268,9 +318,12 @@ export function apply(ctx, config = {}) {
           '留空则语义检索关闭：检索只走关键词，向量文件不读也不写（不造假向量）。',
           '  融合 / 摘要不受影响，它们默认跟当前会话模型走。改完重启 dsh 生效。',
           'bootMaxChars = 总闸门，0 = 不限制（推荐）。注入多少由 memoryCfg 的三层容量自己决定。',
-          'memoryCfg.longMaxChars = L3 视图容量（长期记忆能进上下文的字数）。',
-          '三层（L1/L2/L3）恒定注入，没有开关：想多要或少要就改 memoryCfg 里各自的容量。',
-          'refreshMinMs = L3 视图的刷新间隔（毫秒），默认 1800000（30 分钟）。',
+          'memoryCfg.longMaxChars = L3 视图容量（长期记忆能进上下文的字数），默认 3000。',
+          'inject = 注入总开关。false 时只写不读，适合先验证写入是否正常。',
+          '三层（L1/L2/L3）的容量分别由 memoryCfg.hotMaxChars / consolidateMaxChars / longMaxChars 决定。',
+          '时间类配置一律用分钟：quietMin / organizeEveryMin / refreshMin / semanticTtlMin。',
+          '  （旧版叫 quietMs / organizeEveryMs / refreshMinMs / semanticTtlMs，单位毫秒，读的时候自动换算。）',
+          'refreshMin = L3 视图的刷新间隔（分钟），默认 30。',
           '  这是全局唯一需要节流的地方：L3 排在注入块最前，它一变，后面 L2/L1 的缓存全断。',
           '  L1/L2 不节流——写了就带上下一轮，追加在末尾，不影响前面的缓存。',
           'autoCompact = 每轮结束时把 dsh 自带历史压成一条占位（零 LLM），被压掉的内容先归档进记忆。',
@@ -368,32 +421,32 @@ export function apply(ctx, config = {}) {
   log.info?.('[memory-tiers] 布局 %s · writer=%s · 嵌入 %s', layout, writer, embedSignature)
 
   const mem = layout === 'legacy'
-    ? createMemory5({
+    ? createLegacyMemory({
         dir,
         writer,
         ...models,
         embedSignature,
         // memoryCfg 允许 config.json 覆盖 v5 的底层参数（如 longMaxChars = L3 视图容量）
         cfg: {
-          ...MEM_DEFAULTS,
+          ...MEM_LEGACY_DEFAULTS,
           ...(cfg.memoryCfg || {}),
           summarizeMode: 'deferred',
-          viewRefreshMs: Number(cfg.refreshMinMs) || MEM_DEFAULTS.viewRefreshMs,
+          viewRefreshMs: minutesToMs(cfg.refreshMin, MEM_LEGACY_DEFAULTS.viewRefreshMs),
         },
       })
-    : createMemory6({
+    : createMemory({
         dir,
         writer,
         ...models,
         embedSignature,
         cfg: {
-          ...MEM6_DEFAULTS,
+          ...MEM_SPLIT_DEFAULTS,
           ...(cfg.memoryCfg || {}),
-          viewRefreshMs: Number(cfg.refreshMinMs) || MEM6_DEFAULTS.viewRefreshMs,
-          quietMs: Number.isFinite(Number(cfg.quietMs)) ? Number(cfg.quietMs) : MEM6_DEFAULTS.quietMs,
-          organizeEveryMs: Number(cfg.organizeEveryMs) || MEM6_DEFAULTS.organizeEveryMs,
-          botCaptureChars: Number(cfg.botCaptureChars) || MEM6_DEFAULTS.botCaptureChars,
-          toolCaptureChars: Number(cfg.toolCaptureChars) || MEM6_DEFAULTS.toolCaptureChars,
+          viewRefreshMs: minutesToMs(cfg.refreshMin, MEM_SPLIT_DEFAULTS.viewRefreshMs),
+          quietMs: minutesToMs(cfg.quietMin, MEM_SPLIT_DEFAULTS.quietMs),
+          organizeEveryMs: minutesToMs(cfg.organizeEveryMin, MEM_SPLIT_DEFAULTS.organizeEveryMs),
+          botCaptureChars: Number(cfg.botCaptureChars) || MEM_SPLIT_DEFAULTS.botCaptureChars,
+          toolCaptureChars: Number(cfg.toolCaptureChars) || MEM_SPLIT_DEFAULTS.toolCaptureChars,
         },
       })
 
@@ -557,7 +610,11 @@ export function apply(ctx, config = {}) {
           //   而且每轮重复注入会让「重复度=重要性」信号失真。
           if (d.source?.kind === 'user') {
             const t = takeText(d.content)
-            if (t) buf.user.push(t.slice(0, cfg.userCaptureChars))
+            if (t) {
+              buf.user.push(t.slice(0, cfg.userCaptureChars))
+              // 用这句话预取「相关旧事」（异步，不阻塞本轮）
+              prefetchSemantic(t.slice(0, 200))
+            }
           }
           return
         }
@@ -593,11 +650,13 @@ export function apply(ctx, config = {}) {
           const rows = []
           // 同一个 turnId 标这一轮的所有行：溢出时按整轮取，问题和回答不会被拆开。
           const turnId = `${writer}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
-          for (const t of buf.user) rows.push({ text: t, speaker: 'user', channel: 'dialog', turnId })
+          // scene 占位：桌面端没有「群」的概念，用固定值保持字段形状与 astrbot 一致
+          // （那边是 `平台·群名` / `平台·私聊`）。等有了多会话区分再填真实值。
+          for (const t of buf.user) rows.push({ text: t, speaker: 'user', channel: 'dialog', scene: 'dsh', turnId })
           if (buf.bot.length) {
             const botText = buf.bot.join('\n').trim()
             // ★ 截的是"整轮"的回复，不是每条消息——工具循环里可能有好几条 assistant 正文。
-            if (botText) rows.push({ text: botText.slice(0, cfg.botCaptureChars), speaker: 'bot', channel: 'dialog', turnId })
+            if (botText) rows.push({ text: botText.slice(0, cfg.botCaptureChars), speaker: 'bot', channel: 'dialog', scene: 'dsh', turnId })
           }
           for (const c of buf.tools.values()) {
             // ★ 没配到 result 的也要记：被中断/超时的调用同样是「做过的事」，
@@ -608,6 +667,7 @@ export function apply(ctx, config = {}) {
               text: `运行 ${c.name}「${c.args.slice(0, 120)}」→ ${head}：${out}`,
               speaker: 'bot',
               channel: 'action',
+              scene: 'dsh',
               turnId,
             })
           }
@@ -682,18 +742,69 @@ export function apply(ctx, config = {}) {
   //   ② 快照是**追加**在末尾的，前面历史的缓存不受影响，没什么可省的。
   //
   //   真正要节流的是 L3 的排序（决定哪些 DL3 条目进 L3），它在注入块最前面，
-  //   一动后面全断。那个节流在 memory6 的 L3 快照里做，间隔 = refreshMinMs。
+  //   一动后面全断。那个节流在 memory 的 L3 快照里做，间隔 = refreshMin（分钟）。
   //
   //   这里只保留一条：内容没变就不重复追加，免得每轮多一条一模一样的 user 消息。
+  // ── 相关旧事（与 astrbot 的 semantic_inject 对齐）──
+  //
+  // 为什么是「异步预取 + 同步读」：注入走 systemPrompt.context 的同步取值，
+  // 事件回调 `ctx.on('session/event')` 也是同步的，都不能 await。
+  // 所以 user/message 时启动一次检索，getBlock 时读已完成的结果。
+  //
+  // 取舍：检索可能在本次请求组装之后才完成，于是这轮用不上、下轮才用得上。
+  // 所以带 TTL（默认 3 分钟）——超时的结果宁可不用，也不要把隔夜的话题注进去。
+  let semCache = { text: '', at: 0 }
+  let semBusy = false
+
+  function hitLine(h) {
+    const mmdd = String(h.when || '').match(/\d{1,2}\/\d{1,2}/)
+    const tag = mmdd ? `${mmdd[0]} ` : ''
+    const who = `[${h.layer || '?'}${h.speaker ? '·' + h.speaker : ''}] `
+    const txt = String(h.text || '').replace(/\s+/g, ' ').trim()
+    const sim = Number(h.rel ?? h.sem ?? h.score ?? 0)
+    return `- ${tag}${who}${txt}（${sim.toFixed(2)}）`
+  }
+
+  function prefetchSemantic(q) {
+    if (!cfg.semanticInject || !silicon || semBusy) return
+    const query = String(q || '').trim()
+    if (!query) return
+    semBusy = true
+    Promise.resolve()
+      .then(() => mem.search(query, { limit: cfg.semanticTopK }))
+      .then((res) => {
+        const hits = (res?.hits || []).slice(0, cfg.semanticTopK)
+        // 只留够相关的，避免字面擦边也塞进来
+        const keep = hits.filter((h) => Number(h.rel ?? h.sem ?? 0) >= cfg.semanticMinSim)
+        if (!keep.length) { semCache = { text: '', at: 0 }; return }
+        semCache = { text: ['## 相关的旧事', ...keep.map(hitLine)].join('\n'), at: Date.now() }
+      })
+      .catch((e) => {
+        // 检索失败不影响注入，只留痕
+        appendCaptureLog(dir, `语义检索失败 ${e?.message ?? e}`)
+        semCache = { text: '', at: 0 }
+      })
+      .finally(() => { semBusy = false })
+  }
+
+  const semanticExtra = () => {
+    if (!cfg.semanticInject || !semCache.text) return ''
+    if (Date.now() - semCache.at > minutesToMs(cfg.semanticTtlMin, 3 * 60000)) return ''
+    return semCache.text
+  }
+
   let lastBlock = ''
   const getBlock = () => {
-    const fresh = mem.buildBlock(cfg.bootMaxChars)
+    const fresh = mem.buildBlock(cfg.bootMaxChars, { extra: semanticExtra() })
     if (fresh !== lastBlock) lastBlock = fresh
     return lastBlock
   }
 
   ctx.inject(['systemPrompt'], (c) => {
-    const ok = injectPrompt(c, getBlock)
+    // inject=false：只写不读。不是"注入空串"，而是根本不挂这个 section，
+    // 免得系统提示词里多一条空块把前缀缓存顶掉。
+    const injectOn = cfg.inject !== false
+    const ok = injectOn ? injectPrompt(c, getBlock) : true
     // 写一份状态文件，方便不用翻日志就知道插件有没有接上
     try {
       writeFileSync(
@@ -701,7 +812,8 @@ export function apply(ctx, config = {}) {
         JSON.stringify({
           loadedAt: new Date().toISOString(),
           tools: toolCount,
-          promptInjected: ok,
+          promptInjected: ok && injectOn,
+          inject: injectOn,
           semantic: !!silicon,
           autoCapture: cfg.autoCapture !== false,
           layout,
@@ -714,6 +826,7 @@ export function apply(ctx, config = {}) {
     if (!ok) {
       throw new Error('[memory-tiers] systemPrompt 注入失败：当前版本的 section() 签名与插件不匹配')
     }
+    if (!injectOn) log.info?.('[memory-tiers] 注入已关闭（inject=false）：只写不读')
     log.info?.('[memory-tiers] 已加载，注册 %d 个工具（语义=%s，自动捕获=%s）',
       toolCount, !!silicon, cfg.autoCapture !== false)
   })

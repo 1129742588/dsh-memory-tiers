@@ -98,7 +98,7 @@ window.__ModuleLoader__.load({
     // ── 字段定义：改这里就能增减配置项（服务端白名单见 settings.mjs 的 WRITABLE） ──
     const FIELDS = [
       {
-        group: '数据共享（多个程序共用一个库）',
+        group: '基础（数据目录与写者）',
         path: ['dir'],
         label: '数据目录',
         type: 'text',
@@ -108,7 +108,7 @@ window.__ModuleLoader__.load({
           + '得先知道目录才能读它）。换目录要把旧目录里的文件一起搬过去。改完需重启。',
       },
       {
-        group: '数据共享（多个程序共用一个库）',
+        group: '基础（数据目录与写者）',
         path: ['writer'],
         label: '写者标识',
         type: 'text',
@@ -118,7 +118,7 @@ window.__ModuleLoader__.load({
           + '只读字母、数字、下划线和短横线。改完需重启。',
       },
       {
-        group: '嵌入与重排',
+        group: '向量 / 语义检索',
         path: ['apiKey'],
         label: 'API Key',
         type: 'password',
@@ -126,7 +126,7 @@ window.__ModuleLoader__.load({
         hint: '硅基流动的免费模型也要 key（去硅基流动官网领）。不填就没有语义检索，只走关键词。融合与摘要不受影响——它们默认跟当前会话模型走。改完需重启。',
       },
       {
-        group: '嵌入与重排',
+        group: '向量 / 语义检索',
         path: ['apiBase'],
         label: 'API 地址（两者共用）',
         type: 'text',
@@ -136,7 +136,7 @@ window.__ModuleLoader__.load({
       },
 
       {
-        group: '嵌入与重排',
+        group: '向量 / 语义检索',
         path: ['models', 'embed', 'model'],
         label: '嵌入模型',
         type: 'text',
@@ -145,7 +145,7 @@ window.__ModuleLoader__.load({
         hint: '把记忆变成向量，检索和判重都靠它。硅基流动默认用 BAAI/bge-m3（免费、1024 维）。换模型必须跑一次 reindex，否则旧向量全是废的。',
       },
       {
-        group: '嵌入与重排',
+        group: '向量 / 语义检索',
         path: ['models', 'embed', 'base'],
         label: '嵌入 API 地址',
         type: 'text',
@@ -154,7 +154,7 @@ window.__ModuleLoader__.load({
         hint: '留空 = 用上面「模型连接」里的地址。例：https://api.siliconflow.cn/v1',
       },
       {
-        group: '嵌入与重排',
+        group: '向量 / 语义检索',
         path: ['models', 'embed', 'apiKey'],
         label: '嵌入 API Key',
         type: 'password',
@@ -163,7 +163,7 @@ window.__ModuleLoader__.load({
         hint: '留空 = 用上面的 API Key。',
       },
       {
-        group: '嵌入与重排',
+        group: '向量 / 语义检索',
         path: ['models', 'rerank', 'model'],
         label: '重排模型',
         type: 'text',
@@ -172,7 +172,7 @@ window.__ModuleLoader__.load({
         hint: '检索结果的精排（判断"这条到底相不相关"）。硅基流动默认 BAAI/bge-reranker-v2-m3，和 bge-m3 同门。',
       },
       {
-        group: '嵌入与重排',
+        group: '向量 / 语义检索',
         path: ['models', 'rerank', 'base'],
         label: '重排 API 地址',
         type: 'text',
@@ -181,7 +181,7 @@ window.__ModuleLoader__.load({
         hint: '留空 = 用上面「模型连接」里的地址。',
       },
       {
-        group: '嵌入与重排',
+        group: '向量 / 语义检索',
         path: ['models', 'rerank', 'apiKey'],
         label: '重排 API Key',
         type: 'password',
@@ -191,7 +191,7 @@ window.__ModuleLoader__.load({
       },
 
       {
-        group: '融合与摘要',
+        group: '整理（模型与摘要）',
         path: ['models', 'chat', 'model'],
         label: '融合模型（自己指定时）',
         type: 'text',
@@ -200,7 +200,7 @@ window.__ModuleLoader__.load({
         hint: '判重 / 判矛盾 / 判进展 / 分类。这活只要一个词，用便宜快的小模型就够，别上大模型。',
       },
       {
-        group: '融合与摘要',
+        group: '整理（模型与摘要）',
         path: ['models', 'chat', 'base'],
         label: '融合 API 地址',
         type: 'text',
@@ -209,7 +209,7 @@ window.__ModuleLoader__.load({
         hint: '留空 = 用上面「模型连接」里的地址。',
       },
       {
-        group: '融合与摘要',
+        group: '整理（模型与摘要）',
         path: ['models', 'chat', 'apiKey'],
         label: '融合 API Key',
         type: 'password',
@@ -218,14 +218,14 @@ window.__ModuleLoader__.load({
         hint: '留空 = 用上面的 API Key。',
       },
       {
-        group: '融合与摘要',
+        group: '整理（模型与摘要）',
         path: ['noThink', 'chat'],
         label: '融合时关思考',
         type: 'boolean',
         hint: '推荐开。判关系只要一个词，开思考既慢又费 token，还可能把词藏进推理里。',
       },
       {
-        group: '融合与摘要',
+        group: '整理（模型与摘要）',
         path: ['models', 'summary', 'model'],
         label: '摘要模型（自己指定时）',
         type: 'text',
@@ -234,7 +234,7 @@ window.__ModuleLoader__.load({
         hint: '把一批对话压成摘要。要它读得多、写得准，建议用比融合模型大一号或多一号的。',
       },
       {
-        group: '融合与摘要',
+        group: '整理（模型与摘要）',
         path: ['models', 'summary', 'base'],
         label: '摘要 API 地址',
         type: 'text',
@@ -243,7 +243,7 @@ window.__ModuleLoader__.load({
         hint: '留空 = 用上面「模型连接」里的地址。',
       },
       {
-        group: '融合与摘要',
+        group: '整理（模型与摘要）',
         path: ['models', 'summary', 'apiKey'],
         label: '摘要 API Key',
         type: 'password',
@@ -252,7 +252,7 @@ window.__ModuleLoader__.load({
         hint: '留空 = 用上面的 API Key。',
       },
       {
-        group: '融合与摘要',
+        group: '整理（模型与摘要）',
         path: ['noThink', 'summary'],
         label: '摘要时关思考',
         type: 'boolean',
@@ -260,48 +260,141 @@ window.__ModuleLoader__.load({
       },
 
       {
-        group: '三层容量（决定每轮注入多少字）',
+        group: '注入（每轮拼进上下文的量）',
         path: ['memoryCfg', 'hotMaxChars'],
         label: 'L1 即时层',
         type: 'number',
         hint: '按时间保存的原文。满了取最老一半分流沉淀。默认 2000。',
       },
       {
-        group: '三层容量（决定每轮注入多少字）',
+        group: '注入（每轮拼进上下文的量）',
         path: ['memoryCfg', 'consolidateMaxChars'],
         label: 'L2 巩固层',
         type: 'number',
         hint: '较重要的原话。默认 2500。',
       },
       {
-        group: '三层容量（决定每轮注入多少字）',
+        group: '注入（每轮拼进上下文的量）',
+        path: ['memoryCfg', 'hotQuotaOwn'],
+        label: '自己那一端的配额',
+        type: 'number',
+        hint: '0~1，默认 0.7。L1 视图先紧着自己写的占这么多，剩下的留给另一端；两端用同一规则，注入块才不会来回跳。和 astrbot 的 hot_quota_own 对应。',
+      },
+      {
+        group: '注入（每轮拼进上下文的量）',
         path: ['memoryCfg', 'longMaxChars'],
         label: 'L3 长期层',
         type: 'number',
-        hint: '摘要。这个值直接决定每轮注入块的大小，默认 2000，调大更全但也更贵。',
+        hint: '摘要。这个值直接决定每轮注入块的大小，默认 3000（和 astrbot 的 long_max_chars 对齐），调大更全但也更贵。',
       },
 
       {
-        group: '三层容量（决定每轮注入多少字）',
-        path: ['refreshMinMs'],
-        label: 'L3 视图刷新间隔（毫秒）',
+        group: '注入（每轮拼进上下文的量）',
+        path: ['bootMaxChars'],
+        label: '注入总量上限（字）',
         type: 'number',
-        hint: '默认 1800000（30 分钟）。只有 L3 需要节流：它排在注入块最前，一变后面 L2/L1 的缓存全断。L1/L2 不节流，写了就带上下一轮。',
+        hint: '0（推荐）= 不限制，注入多少由下面 L1/L2/L3 各自容量决定。astrbot 端没有这一项，它靠 hot_max_chars + long_max_chars 分别限制。',
+      },
+      {
+        group: '注入（每轮拼进上下文的量）',
+        path: ['inject'],
+        label: '注入记忆',
+        type: 'boolean',
+        hint: '关掉 = 只写不读，适合先验证抓取是否正常。默认开。',
+      },
+      {
+        group: '注入（每轮拼进上下文的量）',
+        path: ['refreshMin'],
+        label: 'L3 视图刷新间隔（分钟）',
+        type: 'number',
+        hint: '默认 30 分钟。只有 L3 需要节流：它排在注入块最前，一变后面 L2/L1 的缓存全断。L1/L2 不节流，写了就带上下一轮。',
+      },
+      {
+        group: '注入（每轮拼进上下文的量）',
+        path: ['semanticTtlMin'],
+        label: '相关旧事有效期（分钟）',
+        type: 'number',
+        hint: '默认 3 分钟。超时就重新检索，避免把隔夜的话题带进这一轮。',
       },
 
       {
-        group: '写入捕获',
+        group: '整理（模型与摘要）',
+        path: ['quietMin'],
+        label: '安静多久才整理（分钟）',
+        type: 'number',
+        hint: '默认 10 分钟：只把已经安静下来的轮次拿去压缩，避免聊到一半被摘要腰斩。',
+      },
+      {
+        group: '整理（模型与摘要）',
+        path: ['memoryCfg', 'forgetThreshold'],
+        label: '遗忘阈值',
+        type: 'number',
+        hint: '0~1，默认 0.25。DL1 里保持率低于这个值就忘掉，忘之前先写台账 graveyard/forgotten.jsonl。和 astrbot 的 forget_threshold 对应。',
+      },
+      {
+        group: '整理（模型与摘要）',
+        path: ['memoryCfg', 'l2KeepMax'],
+        label: '每轮最多沉淀几条',
+        type: 'number',
+        hint: '默认 10。一次整理里最多挑几条进 L2，其余落流水账（不丢，只是不再常驻上下文）。和 astrbot 的 l2_keep_max 对应。',
+      },
+      {
+        group: '整理（模型与摘要）',
+        path: ['memoryCfg', 'summaryChunk'],
+        label: '摘要分片（条）',
+        type: 'number',
+        hint: '默认 60。太大容易超上下文（十万条会一次打出百万 token），太小则摘要碎片化。和 astrbot 的 summary_chunk 对应。',
+      },
+      {
+        group: '整理（模型与摘要）',
+        path: ['organizeEveryMin'],
+        label: '整理间隔（分钟）',
+        type: 'number',
+        hint: '默认 5 分钟补一轮。太勤会白跑——没到容量就不动。',
+      },
+
+      {
+        group: '抓取',
         path: ['userCaptureChars'],
         label: '单条用户消息上限',
         type: 'number',
         hint: '默认 2000 字。超长消息只记前这么多。',
       },
       {
-        group: '写入捕获',
+        group: '抓取',
         path: ['toolCaptureChars'],
         label: '工具输出上限',
         type: 'number',
-        hint: '默认 500 字。bash 一次能吐几万字，L1 才 2000 字。',
+        hint: '默认 500 字。bash 一次能吐几万字，L1 才 3000 字。',
+      },
+      {
+        group: '抓取',
+        path: ['botCaptureChars'],
+        label: '回复截断',
+        type: 'number',
+        hint: '默认 400 字。一轮回复拼起来再截（不是每条消息截），和 astrbot 的 capture_bot_chars 对齐。',
+      },
+
+      {
+        group: '自身历史压缩',
+        path: ['autoCompact'],
+        label: '每轮压缩 dsh 历史',
+        type: 'boolean',
+        hint: '把 dsh 自带会话历史压成一条占位（零 LLM 调用），被压掉的内容先归档进记忆。默认开。',
+      },
+      {
+        group: '自身历史压缩',
+        path: ['compactKeepTurns'],
+        label: '压缩后保留几轮',
+        type: 'number',
+        hint: '0（默认）= 一条不留，全交给记忆（L1 就是历史）。想留点临时内容就调大。',
+      },
+      {
+        group: '自身历史压缩',
+        path: ['compactArchiveChars'],
+        label: '每轮归档字数',
+        type: 'number',
+        hint: '默认 1200 字。压缩前把这一轮归档进记忆的字数上限。',
       },
     ]
 
@@ -550,8 +643,8 @@ window.__ModuleLoader__.load({
         ...GROUPS.map((g) =>
           h('div', { key: g },
             h('div', { className: 'dmt-group' }, g),
-            g === '嵌入与重排' ? presetCards : null,
-            g === '融合与摘要' ? sessionBlock : null,
+            g === '向量 / 语义检索' ? presetCards : null,
+            g === '整理（模型与摘要）' ? sessionBlock : null,
             h('div', { className: 'dmt-rows' },
               FIELDS.filter((f) => f.group === g && (!f.showIf || f.showIf(cfg, live))).map((f) =>
                 h(Field, {
