@@ -1,15 +1,15 @@
 {
   "name": "dsh-memory-tiers",
-  "version": "0.8.4",
-  "description": "让 dsh 记住你说过的话，忘掉无关的，聊再久也不多花钱。",
+  "version": "1.2.1",
+  "description": "dsh 的六层本地记忆：每轮收进 L1，安静后分流成摘要与原文档，长期层注入上下文，并用记忆替代对话历史。",
   "type": "module",
   "main": "index.mjs",
   "license": "MIT",
   "keywords": [
     "dsh",
     "dsh-plugin",
+    "deepseek-harness",
     "memory",
-    "compaction",
     "context"
   ],
   "repository": {
@@ -32,30 +32,25 @@
   "exports": {
     ".": "./index.mjs",
     "./client": "./client.mjs",
-    "./compaction.mjs": "./compaction.mjs",
-    "./memory.mjs": "./memory.mjs",
+    "./memory": "./memory.mjs",
+    "./llm": "./llm.mjs",
+    "./settings": "./settings.mjs",
     "./cordis.patch.yml": "./cordis.patch.yml",
-    "./package.json": "./package.json",
-    "./dshllm.mjs": "./dshllm.mjs"
+    "./package.json": "./package.json"
   },
   "files": [
     "index.mjs",
-    "client.mjs",
-    "settings.mjs",
-    "compaction.mjs",
     "memory.mjs",
-    "silicon.mjs",
+    "llm.mjs",
+    "settings.mjs",
+    "client.mjs",
     "cordis.patch.yml",
-    "README.md",
-    "ARCHITECTURE.md",
-    "dshllm.mjs"
+    "README.md"
   ],
   "engines": {
     "node": ">=20"
   },
   "scripts": {
-    "test:memory": "node ../test/test_fuse_vector.mjs",
-    "test:config": "node ../test/test_config.mjs",
-    "test": "node ../test/test_config.mjs"
+    "test": "node --test ../test/memory.test.mjs ../test/config.test.mjs ../test/flow.test.mjs"
   }
 }
