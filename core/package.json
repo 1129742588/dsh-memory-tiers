@@ -1,7 +1,7 @@
 {
   "name": "dsh-memory-tiers",
-  "version": "1.2.2",
-  "description": "dsh 的六层本地记忆：每轮收进 L1，安静后分流成摘要与原文档，长期层注入上下文，并用记忆替代对话历史。",
+  "version": "1.3.0",
+  "description": "dsh 的六层本地记忆：每轮收进 L1，满了分流成摘要与原文档，长期层注入上下文，并用记忆替代对话历史；按会话工作模式、人格槽位、记忆星图与热改配置。",
   "type": "module",
   "main": "index.mjs",
   "license": "MIT",
@@ -35,6 +35,7 @@
     "./memory": "./memory.mjs",
     "./llm": "./llm.mjs",
     "./settings": "./settings.mjs",
+    "./star": "./star.mjs",
     "./cordis.patch.yml": "./cordis.patch.yml",
     "./package.json": "./package.json"
   },
@@ -44,6 +45,7 @@
     "llm.mjs",
     "settings.mjs",
     "client.mjs",
+    "star.mjs",
     "cordis.patch.yml",
     "README.md"
   ],

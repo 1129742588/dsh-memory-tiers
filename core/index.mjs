@@ -23,13 +23,17 @@ import {
   mkdirSync, writeFileSync, appendFileSync, renameSync, unlinkSync,
   existsSync, readdirSync, statSync, readFileSync,
 } from 'node:fs'
-import { join, dirname } from 'node:path'
+import { join, dirname, basename } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { createMemory } from './memory.mjs'
 import { createLlm, createSessionCaller } from './llm.mjs'
+import { layersFromMemory, buildPayload, renderHtml } from './star.mjs'
 import {
-  loadConfig, configPath, logPath, statusPath, contextPath,
+  loadConfig, configPath, logPath, statusPath, contextPath, sessionsPath,
   resolveDataDir, toEngineCfg, toLlmCfg, installApi,
+  loadSessions, saveSessions, resolveSessionMode, setSessionWorkMode,
+  clearSessionExemption, recordSessionTurn, sessionStats,
+  SCHEMA, getPath, setPath, isReloadPath,
 } from './settings.mjs'
 
 export const name = 'memory-tiers'
@@ -357,25 +361,93 @@ export function apply(ctx, patchConfig = {}) {
 
   // ── ① 配置 ──
   const loaded = step('config', () => loadConfig({ env, log: audit }), null)
-  const cfg = loaded?.config || loadConfig({ env, log: () => {} }).config
-  const dataDir = resolveDataDir(cfg, env)
-  const writer = String(cfg.writer || 'dsh')
-  // 工作模式：专注干活 —— 不注入、不压缩，但照常记录与整理，且用专属的大容量配置。
-  // 启动时定死（配置本来就要重载插件生效），运行期不再变。
-  const workMode = cfg.workMode?.enabled === true
-  if (workMode) {
-    audit('WORK_MODE', `on hotChars=${cfg.workMode.hotChars} consolidateChars=${cfg.workMode.consolidateChars}`
-      + ` user=${cfg.workMode.userChars} bot=${cfg.workMode.botChars} tool=${cfg.workMode.toolChars}`)
+  // runCfg = 运行中实际生效的配置：热改字段保存后就地替换，需重载字段保留旧值。
+  let runCfg = loaded?.config || loadConfig({ env, log: () => {} }).config
+  const dataDir = resolveDataDir(runCfg, env)
+  const writer = String(runCfg.writer || 'dsh')
+
+  // ── ①.5 会话状态（工作模式按会话 + 接管豁免）──
+  const sessionState = step('sessions', () => loadSessions({ env, log: audit }), {
+    version: 1, updatedAt: 0, sessions: {}, path: sessionsPath(env),
+  })
+  let sessionsTimer = null
+  const flushSessions = () => {
+    if (sessionsTimer) { clearTimeout(sessionsTimer); sessionsTimer = null }
+    saveSessions(sessionState, { env, log: audit })
+  }
+  const scheduleSessions = () => {
+    if (sessionsTimer) return
+    sessionsTimer = setTimeout(() => { sessionsTimer = null; saveSessions(sessionState, { env, log: audit }) }, 1000)
+    if (sessionsTimer.unref) sessionsTimer.unref()
+  }
+
+  const globalWorkDefault = () => runCfg.workMode?.enabled === true
+  const modeOf = (sid) => resolveSessionMode(sessionState, sid, globalWorkDefault())
+  const isWorkLike = (sid) => {
+    const m = modeOf(sid)
+    return m === 'work' || m === 'exempt'
+  }
+  /** 共享 L1：只要有一个会话处于工作模式/已豁免，就启用工作模式的大容量 */
+  const anyWorkLike = () => {
+    if (globalWorkDefault()) return true
+    for (const sid of Object.keys(sessionState.sessions || {})) if (isWorkLike(sid)) return true
+    return false
+  }
+  const sessionModeLabel = (sid) => {
+    const mode = modeOf(sid)
+    if (mode === 'work') return '工作模式'
+    if (mode === 'exempt') return '工作模式 · 已豁免'
+    const inject = runCfg.inject?.enabled !== false
+    const compaction = runCfg.compaction?.enabled !== false
+    return inject && compaction ? '记忆接管' : '普通'
+  }
+  if (globalWorkDefault()) audit('WORK_MODE', 'global-default=on')
+
+  // ── ①.8 人格槽位 ──
+  // 配置正文 + 其它插件注册的片段；按 (order, id) 确定性拼接，逐字稳定。
+  // 关掉 persona.enabled 时两者都不生效；空文本不产生任何注入。
+  const personaParts = new Map()
+  const personaApi = {
+    register({ id, order = 100, text } = {}) {
+      const key = String(id || '').trim()
+      const body = String(text || '').trim()
+      if (!key || !body) throw new Error('persona.register 需要非空 id 与 text')
+      const part = { id: key, order: Number.isFinite(Number(order)) ? Number(order) : 100, text: body }
+      personaParts.set(key, part)
+      return () => { if (personaParts.get(key) === part) personaParts.delete(key) }
+    },
+    list() {
+      const cmp = (a, b) => (a.order - b.order) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)
+      return [...personaParts.values()].map((x) => ({ ...x })).sort(cmp)
+    },
+  }
+  try { ctx.provide?.('memoryTiersPersona', personaApi) } catch (e) {
+    boot.errors.push({ step: 'persona-api', error: String(e?.message ?? e) })
+    audit('BOOT_FAIL', `persona-api ${e?.message ?? e}`)
+  }
+  function personaText() {
+    if (runCfg.persona?.enabled === false) return ''
+    const parts = []
+    const own = String(runCfg.persona?.text || '').trim()
+    if (own) parts.push({ id: 'config', order: 0, text: own })
+    for (const p of personaApi.list()) parts.push(p)
+    const out = parts.map((p) => p.text.trim()).filter(Boolean).join('\n\n')
+    if (out.length <= 8000) return out
+    audit('PERSONA_TRUNCATED', `${out.length}→8000`)
+    return out.slice(0, 8000)
   }
 
   // ── ② 引擎 + 模型 ──
   const session = createSessionCaller(() => ctx, { log: (k, d) => audit(k, d) })
   const llm = step('model', () => createLlm({
-    ...toLlmCfg(cfg),
+    ...toLlmCfg(runCfg),
     getSession: () => {
       const info = session.info()
       return info.available ? { ...info, call: session.call } : info
     },
+    // 人格只在分流/分类时作为临时 system 前缀；读运行中配置，默认关。
+    getPersona: () => personaText(),
+    personaInSummary: () => runCfg.persona?.inSummary === true,
     onLog: (kind, detail) => audit(kind, detail),
   }), null)
 
@@ -386,7 +458,7 @@ export function apply(ctx, patchConfig = {}) {
   // 向量指纹：换 embed 模型后旧向量不可比较，要能被识别出来（不是静默变乱）
   const embedSig = caps.embed ? `api:${caps.embedModel || 'unknown'}` : 'none'
 
-  const engineCfg = { ...toEngineCfg(cfg) }
+  let engineCfg = toEngineCfg(runCfg, { workMode: anyWorkLike() })
   const mem = step('memory', () => {
     mkdirSync(dataDir, { recursive: true })
     relocateLegacyFiles(dataDir, audit)
@@ -417,6 +489,18 @@ export function apply(ctx, patchConfig = {}) {
   }
 
   const stats = () => { try { return mem.stats() } catch { return null } }
+  // 抓取截断：普通模式与工作模式两套；工作模式按会话取，豁免会话也用工作模式那套。
+  const normalCap = () => ({
+    user: Number(runCfg.capture?.userChars) || 2000,
+    bot: Number(runCfg.capture?.botChars) || 400,
+    tool: Number(runCfg.capture?.toolChars) || 500,
+  })
+  const workCap = () => ({
+    user: Number(runCfg.workMode?.userChars) || 4000,
+    bot: Number(runCfg.workMode?.botChars) || 800,
+    tool: Number(runCfg.workMode?.toolChars) || 1200,
+  })
+  const capFor = (sid) => (isWorkLike(sid) ? workCap() : normalCap())
   // 配置页接口：挂载后记下端口（dsh 的 webServer 有 get port()，listen 之后才有值），
   // 取证工具靠 status.json 里的 baseUrl 自动找到它（端口每次重启都会变）。
   let api = null
@@ -453,18 +537,24 @@ export function apply(ctx, patchConfig = {}) {
         return out
       })(),
       workMode: {
-        enabled: workMode,
+        enabled: globalWorkDefault(),
+        perSession: true,
         hotChars: engineCfg.hotMaxChars,
         consolidateChars: engineCfg.consolidateMaxChars,
-        capture: { ...cap },
+        capture: { ...workCap() },
+        captureNormal: { ...normalCap() },
+        sessions: sessionStats(sessionState),
       },
+      persona: { enabled: runCfg.persona?.enabled !== false, chars: personaText().length, inSummary: runCfg.persona?.inSummary === true },
+      sessions: sessionStats(sessionState),
       api: apiInfo(),
+      star: { url: apiPort() ? `http://127.0.0.1:${apiPort()}/dsh-memory/star` : null },
       session: (() => { try { return session.info() } catch { return null } })(),
       config: {
-        inject: cfg.inject.enabled !== false,
+        inject: runCfg.inject.enabled !== false,
         injectReason: injection.reason,
-        capture: cfg.capture.enabled !== false,
-        compaction: { enabled: cfg.compaction.enabled !== false, keepTurns: Number(cfg.compaction.keepTurns) || 0 },
+        capture: runCfg.capture.enabled !== false,
+        compaction: { enabled: runCfg.compaction.enabled !== false, keepTurns: Number(runCfg.compaction.keepTurns) || 0 },
       },
     }
   }
@@ -599,36 +689,31 @@ export function apply(ctx, patchConfig = {}) {
   })
 
   // ── ④ 抓取：session/event → L1 ──
-  const captureOn = cfg.capture.enabled !== false
+  const captureEnabled = () => runCfg.capture?.enabled !== false
   const buffers = new Map()
-  // 截断字数取「实际生效值」：工作模式用专属大容量（bot/tool 已由 toEngineCfg 覆盖）
-  const cap = {
-    user: workMode ? (Number(cfg.workMode.userChars) || 4000) : (Number(cfg.capture.userChars) || 2000),
-    bot: workMode ? (Number(cfg.workMode.botChars) || 800) : (Number(cfg.capture.botChars) || 400),
-    tool: workMode ? (Number(cfg.workMode.toolChars) || 1200) : (Number(cfg.capture.toolChars) || 500),
-  }
 
   // 相关旧事（可选）：注入走的是同步取值，而检索是异步的。
   // 所以收到用户消息时先起一次检索，注入时读已经完成的结果；带 TTL，
-  // 免得把隔夜的话题塞进这一轮。
-  const semOn = cfg.capture.semantic?.enabled === true && !!caps.embed
-  const semCfg = {
-    topK: Number(cfg.capture.semantic?.topK) || 5,
-    minSim: Number(cfg.capture.semantic?.minSim) ?? 0.35,
-    ttlMs: (Number(cfg.capture.semantic?.ttlMin) || 3) * 60 * 1000,
-  }
+  // 免得把隔夜的话题塞进这一轮。配置热改时这里每次现读。
+  const semanticOn = () => runCfg.capture?.semantic?.enabled === true && !!caps.embed
+  const semanticCfg = () => ({
+    topK: Number(runCfg.capture?.semantic?.topK) || 5,
+    minSim: Number(runCfg.capture?.semantic?.minSim) ?? 0.35,
+    ttlMs: (Number(runCfg.capture?.semantic?.ttlMin) || 3) * 60 * 1000,
+  })
   let semCache = { text: '', at: 0 }
   let semBusy = false
 
   function prefetchSemantic(query) {
-    if (!semOn || semBusy) return
+    if (!semanticOn() || semBusy) return
     const q = String(query || '').trim()
     if (!q) return
+    const sc = semanticCfg()
     semBusy = true
     Promise.resolve()
-      .then(() => mem.search(q.slice(0, 200), { limit: semCfg.topK }))
+      .then(() => mem.search(q.slice(0, 200), { limit: sc.topK }))
       .then((res) => {
-        const keep = (res?.hits || []).filter((h) => Number(h.rel ?? h.score ?? 0) >= semCfg.minSim)
+        const keep = (res?.hits || []).filter((h) => Number(h.rel ?? h.score ?? 0) >= sc.minSim)
         semCache = keep.length
           ? { text: ['## 相关的旧事', ...keep.map((h) => `- ${h.when} [${h.layer}] ${String(h.text).replace(/\s+/g, ' ')}`)].join('\n'), at: Date.now() }
           : { text: '', at: 0 }
@@ -638,13 +723,13 @@ export function apply(ctx, patchConfig = {}) {
   }
 
   const semanticExtra = () => {
-    if (!semOn || !semCache.text) return null
-    if (Date.now() - semCache.at > semCfg.ttlMs) return null
+    if (!semanticOn() || !semCache.text) return null
+    if (Date.now() - semCache.at > semanticCfg().ttlMs) return null
     return semCache.text
   }
 
   const bufOf = (sid) => {
-    if (!buffers.has(sid)) buffers.set(sid, { user: [], bot: [], tools: new Map(), chars: 0 })
+    if (!buffers.has(sid)) buffers.set(sid, { user: [], bot: [], tools: new Map(), chars: 0, cwd: '' })
     return buffers.get(sid)
   }
 
@@ -660,20 +745,56 @@ export function apply(ctx, patchConfig = {}) {
     return false
   }
 
-  const makeRows = (buf) => {
+  const tidy = (s) => String(s || '')
+    .replace(/```[\s\S]*?```/g, '[代码]')
+    .replace(/\s+/g, ' ')
+    .trim()
+
+  /**
+   * 工作模式骨架：一条轮次只留「地点 / 事件 / 做了什么 / 结论」。
+   * 时间由条目 createdAt 承载（注入与摘要都会渲染日期时间），不重复写进正文。
+   */
+  const makeSkeletonRows = (buf, { sid, at }) => {
+    const sk = runCfg.workMode?.skeleton || {}
+    const userChars = Math.max(20, Number(sk.userChars) || 240)
+    const botChars = Math.max(20, Number(sk.botChars) || 200)
+    const userText = tidy(buf.user.join(' ')).slice(0, userChars)
+    const botText = tidy(buf.bot[buf.bot.length - 1] || buf.bot.join('\n')).slice(0, botChars)
+    const tools = [...buf.tools.values()].map((c) => {
+      const head = c.err ? '失败' : (c.done ? '完成' : '未完成')
+      return `${c.name} ${head}`
+    })
+    const place = buf.cwd ? `@${basename(buf.cwd)} ` : ''
+    const bits = [`${place}用户提出：${userText || '（本轮没有文字请求）'}`]
+    if (tools.length) bits.push(`做了什么：${tools.join('、')}`)
+    if (botText) bits.push(`结论（模型）：${botText}`)
     const turnId = `${writer}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+    audit('SKELETON', `session=${sid} chars=${bits.join(' ').length} tools=${tools.length}`)
+    return [{
+      text: bits.join('；'),
+      speaker: 'user', channel: 'event', scene: 'work', turnId,
+    }]
+  }
+
+  const makeRows = (buf, { sid, at } = {}) => {
+    const turnId = `${writer}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+    const workLike = isWorkLike(sid)
+    if (workLike && runCfg.workMode?.skeleton?.enabled !== false) {
+      return makeSkeletonRows(buf, { sid, at: at || Date.now() })
+    }
+    const cap = capFor(sid)
     const rows = []
-    for (const t of buf.user) rows.push({ text: t, speaker: 'user', channel: 'dialog', scene: 'dsh', turnId })
+    for (const t of buf.user) rows.push({ text: t, speaker: 'user', channel: 'dialog', scene: workLike ? 'work' : 'dsh', turnId })
     if (buf.bot.length) {
       const botText = buf.bot.join('\n').trim()
-      if (botText) rows.push({ text: botText.slice(0, cap.bot), speaker: 'bot', channel: 'dialog', scene: 'dsh', turnId })
+      if (botText) rows.push({ text: botText.slice(0, cap.bot), speaker: 'bot', channel: 'dialog', scene: workLike ? 'work' : 'dsh', turnId })
     }
     for (const c of buf.tools.values()) {
       const out = c.done ? (c.out || '（无输出）') : '（被中断，无结果）'
       const head = c.err ? '失败' : (c.done ? '完成' : '未完成')
       rows.push({
         text: `运行 ${c.name}「${String(c.args || '').slice(0, 120)}」→ ${head}：${out}`,
-        speaker: 'bot', channel: 'action', scene: 'dsh', turnId,
+        speaker: 'bot', channel: 'action', scene: workLike ? 'work' : 'dsh', turnId,
       })
     }
     return rows
@@ -682,31 +803,33 @@ export function apply(ctx, patchConfig = {}) {
   /** 压缩：单飞 + 只在本轮已进 L1 时才做 */
   let compacting = false
   const compactTurn = async (sessionObj, { alreadyArchived }) => {
-    // 工作模式：会话表现保持正常 —— 历史一点都不动
-    if (workMode) {
-      audit('COMPACT_SKIP', 'reason=work-mode')
+    const sid = sessionObj?.id || 'default'
+    const mode = modeOf(sid)
+    // 工作模式 / 已豁免：会话表现保持正常 —— 历史一点都不动
+    if (mode === 'work' || mode === 'exempt') {
+      audit('COMPACT_SKIP', `reason=session-${mode}`)
       return null
     }
-    if (cfg.compaction.enabled === false) return null
+    if (runCfg.compaction.enabled === false) return null
     if (!sessionObj) return null
-    if (cfg.inject.enabled === false && (Number(cfg.compaction.keepTurns) || 0) === 0) {
+    if (runCfg.inject.enabled === false && (Number(runCfg.compaction.keepTurns) || 0) === 0) {
       // 历史全替 + 不注入 = 模型什么都看不到，宁可不替
       audit('COMPACT_SKIP', 'reason=inject-disabled')
       return null
     }
     // 兜底：全替之前确认「记忆块」真的不是空的（没模型、库是空的、全在 DL1 等模型时，
     // 替掉历史就等于让模型失忆）。
-    if ((Number(cfg.compaction.keepTurns) || 0) === 0) {
+    if ((Number(runCfg.compaction.keepTurns) || 0) === 0) {
       let block = ''
-      try { block = mem.buildBlock(Number(cfg.inject.maxChars) || 0, {}) } catch { block = '' }
+      try { block = mem.buildBlock(Number(runCfg.inject.maxChars) || 0, {}) } catch { block = '' }
       if (!block) { audit('COMPACT_SKIP', 'reason=no-context'); return null }
     }
     if (compacting) return null
     compacting = true
     try {
       return await compactSurface(sessionObj, mem, {
-        keepTurns: Number(cfg.compaction.keepTurns) || 0,
-        archiveChars: Number(cfg.compaction.archiveChars) || 1200,
+        keepTurns: Number(runCfg.compaction.keepTurns) || 0,
+        archiveChars: Number(runCfg.compaction.archiveChars) || 1200,
         alreadyArchived,
         audit,
       })
@@ -719,25 +842,32 @@ export function apply(ctx, patchConfig = {}) {
     const buf = buffers.get(sid)
     if (!buf) return false
     buffers.delete(sid)
-    const rows = makeRows(buf)
+    const rows = makeRows(buf, { sid, at: Date.now() })
     return writeRows(rows, { user: buf.user.length, bot: buf.bot.length, tool: buf.tools.size })
   }
 
   const captureOff = step('capture', () => {
-    if (!captureOn) { audit('CAPTURE_OFF'); return }
     if (typeof ctx.on !== 'function') throw new Error('ctx.on 不可用')
+    if (!captureEnabled()) audit('CAPTURE_OFF')
 
     const handler = (sessionObj, event) => {
       const d = event?.data || {}
       const sid = sessionObj?.id || 'default'
+      if (!captureEnabled()) {
+        // 关掉自动记录：不要留着半轮缓冲；下次打开后从新轮次开始
+        if (event.type === 'turn/end') buffers.delete(sid)
+        return
+      }
       const buf = bufOf(sid)
+      const cwd = sessionObj?.header?.cwd || sessionObj?.cwd
+      if (cwd) buf.cwd = cwd
 
       if (event.type === 'user/message') {
         // 只记真人输入：agent.inject / skill / cron 也走这个事件，但它们 source.kind 不是 'user'
         if (d.source?.kind !== 'user') return
         const t = takeText(d.content)
         if (!t) return
-        buf.user.push(t.slice(0, cap.user))
+        buf.user.push(t.slice(0, capFor(sid).user))
         buf.chars += t.length
         prefetchSemantic(t.slice(0, 200))
         return
@@ -761,7 +891,7 @@ export function apply(ctx, patchConfig = {}) {
         const cid = d.callId ?? d.message?.toolCallId ?? d.message?.source?.callId
         const c = cid ? buf.tools.get(cid) : undefined
         if (c) {
-          c.out = takeText(d.message?.content).slice(0, cap.tool)
+          c.out = takeText(d.message?.content).slice(0, capFor(sid).tool)
           c.err = !!(d.isError ?? d.message?.isError)
           c.done = true
         }
@@ -776,7 +906,14 @@ export function apply(ctx, patchConfig = {}) {
         buf.user.length = Math.min(buf.user.length, 50)
       }
 
-      const rows = makeRows(buf)
+      // 确实产生过真人轮次才记 turns；工作模式/已豁免时置 everWorked（豁免的依据）。
+      // 写在压缩之前：即使写 L1 失败，这个会话的历史也不该被压掉。
+      if (buf.user.length > 0) {
+        const rec = recordSessionTurn(sessionState, sid, { wasWorkLike: isWorkLike(sid) })
+        if (rec) scheduleSessions()
+      }
+
+      const rows = makeRows(buf, { sid, at: Date.now() })
       const stat = { user: buf.user.length, bot: buf.bot.length, tool: buf.tools.size }
       buffers.delete(sid)
 
@@ -793,13 +930,18 @@ export function apply(ctx, patchConfig = {}) {
     }
 
     const off = ctx.on('session/event', handler)
-    audit('CAPTURE_ON', `user=${cap.user} bot=${cap.bot} tool=${cap.tool}`)
+    audit('CAPTURE_ON', `normal=${JSON.stringify(normalCap())} work=${JSON.stringify(workCap())}`)
     return () => { try { off?.() } catch { /* 已卸 */ } }
   })
 
   // ── ⑤ 注入 ──
-  // injection.reason：为什么没注入（inject-disabled / work-mode），页面和 /memory 用得到
+  // injection.reason：最近一次没注入的原因（work-mode / session-exempt / inject-disabled），页面和 /memory 用得到
   const injection = { mode: 'none', ok: false, reason: null }
+
+  const sidFromAssembly = (asm) => {
+    const id = asm?.agent?.session?.id ?? asm?.agent?.sessionId ?? asm?.sessionId ?? null
+    return id ? String(id) : null
+  }
 
   /**
    * 本轮会注入的记忆块（插件自己按当前库实时构建）。
@@ -809,12 +951,16 @@ export function apply(ctx, patchConfig = {}) {
    *   而命令执行在组装之前，加上 keepTurns=0 的压缩把上一轮快照替换成了占位，
    *   所以会话消息里必然看不到本轮的块。要「看注入内容」只能自己构建。
    */
-  const buildInjectedBlock = () => {
-    if (workMode) return ''
-    if (cfg.inject.enabled === false) return ''
+  const buildInjectedBlock = (asm = null, forcedSid = null) => {
+    const sid = forcedSid || sidFromAssembly(asm)
+    const mode = sid ? modeOf(sid) : (globalWorkDefault() ? 'work' : 'normal')
+    if (mode === 'work') { injection.reason = 'work-mode'; return '' }
+    if (mode === 'exempt') { injection.reason = 'session-exempt'; return '' }
+    if (runCfg.inject.enabled === false) { injection.reason = 'inject-disabled'; return '' }
+    injection.reason = null
     try {
-      return mem.buildBlock(Number(cfg.inject.maxChars) || 0, {
-        notice: Number(cfg.compaction.keepTurns) === 0 && cfg.compaction.enabled !== false
+      return mem.buildBlock(Number(runCfg.inject.maxChars) || 0, {
+        notice: Number(runCfg.compaction.keepTurns) === 0 && runCfg.compaction.enabled !== false
           ? '（当前会话的对话历史已由记忆替代；需要原话细节请调用 memory_search）'
           : '',
         extra: semanticExtra(),
@@ -828,38 +974,85 @@ export function apply(ctx, patchConfig = {}) {
   const injectBlock = (c, svcArg) => {
     const svc = svcArg || c?.systemPrompt || ctx.systemPrompt
     if (!svc) throw new Error('没有 systemPrompt 服务')
-    if (workMode) {
-      injection.mode = 'off'
-      injection.ok = true
-      injection.reason = 'work-mode'
-      audit('INJECT_OFF', 'reason=work-mode')
-      writeStatus(env, { inject: { enabled: false, mode: 'off', ok: true, reason: 'work-mode' } })
-      return
-    }
-    if (cfg.inject.enabled === false) {
-      injection.mode = 'off'
-      injection.ok = true
-      injection.reason = 'inject-disabled'
-      audit('INJECT_OFF', 'reason=inject-disabled')
-      writeStatus(env, { inject: { enabled: false, mode: 'off', ok: true, reason: 'inject-disabled' } })
-      return
-    }
+    // 始终注册：工作模式/注入关闭都由 provider 返回空串决定。
+    // 这样按会话切换、保存配置热改都能立刻生效，不需要重载插件。
+    const personaFn = () => personaText()
     if (typeof svc.context === 'function') {
-      svc.context({ name: 'memory-tiers', order: 250, text: buildInjectedBlock, interpolate: false })
+      svc.context({ name: 'memory-tiers-persona', order: 200, text: personaFn, interpolate: false })
+      svc.context({ name: 'memory-tiers', order: 250, text: (asm) => buildInjectedBlock(asm), interpolate: false })
       injection.mode = 'context'
     } else if (typeof svc.section === 'function') {
-      svc.section({ name: 'memory-tiers', order: 10300, text: buildInjectedBlock, interpolate: false })
+      svc.section({ name: 'memory-tiers-persona', order: 10150, text: personaFn, interpolate: false })
+      svc.section({ name: 'memory-tiers', order: 10300, text: (asm) => buildInjectedBlock(asm), interpolate: false })
       injection.mode = 'section'
     } else {
       throw new Error('systemPrompt 既没有 context() 也没有 section()')
     }
     injection.ok = true
-    injection.reason = null
-    // 注入是否真的挂上，是「它到底记不记得」的第一现场，单独落一次状态
+    // 挂载状态落一次；具体会话为什么没注入由 /session 与 /memory context 查。
     writeStatus(env, { inject: { enabled: true, mode: injection.mode, ok: true, reason: null } })
     audit('INJECT_ON', injection.mode)
   }
   withService('systemPrompt', injectBlock)
+
+  // ── ⑤.5 热改 + 会话接口的公共逻辑 ──
+  /** 把保存后的配置里「能热改的字段」换进运行态；重载字段保留旧值，交给页面标「待重载」。 */
+  const applyLiveConfig = (next) => {
+    const merged = JSON.parse(JSON.stringify(next || {}))
+    for (const f of SCHEMA) {
+      if (isReloadPath(f.path)) setPath(merged, f.path, getPath(runCfg, f.path))
+    }
+    runCfg = merged
+    recomputeWorkCapacity()
+    audit('CONFIG_APPLIED', `live=${SCHEMA.filter((f) => !isReloadPath(f.path)).length} reload=${SCHEMA.filter((f) => isReloadPath(f.path)).length}`)
+  }
+  function recomputeWorkCapacity() {
+    const next = toEngineCfg(runCfg, { workMode: anyWorkLike() })
+    try { mem.updateConfig(next) } catch (e) { audit('ENGINE_CFG_FAIL', String(e?.message ?? e)) }
+    engineCfg = next
+  }
+  const sessionInfo = (sid) => {
+    const rec = sessionState.sessions?.[String(sid)] || null
+    const mode = modeOf(sid)
+    return {
+      sessionId: String(sid),
+      mode,
+      label: sessionModeLabel(sid),
+      workMode: rec?.workMode ?? null,
+      everWorked: rec?.everWorked === true,
+      turns: rec?.turns || 0,
+      lastActiveAt: rec?.lastActiveAt || 0,
+      exempt: mode === 'exempt',
+      globalWorkMode: globalWorkDefault(),
+    }
+  }
+  const sessionsApi = {
+    list() {
+      const rows = Object.keys(sessionState.sessions || {})
+        .map((sid) => sessionInfo(sid))
+        .sort((a, b) => (b.lastActiveAt || 0) - (a.lastActiveAt || 0))
+      return { sessions: rows, globalWorkMode: globalWorkDefault(), counts: sessionStats(sessionState) }
+    },
+    get(sid) { return sessionInfo(sid) },
+    setMode(sid, on) {
+      const id = String(sid || '').trim()
+      if (!id) throw new Error('缺 sessionId')
+      setSessionWorkMode(sessionState, id, on === true)
+      flushSessions()
+      recomputeWorkCapacity()
+      audit('SESSION_MODE', `${id} workMode=${on === true}`)
+      return sessionInfo(id)
+    },
+    clearExemption(sid) {
+      const id = String(sid || '').trim()
+      if (!id) throw new Error('缺 sessionId')
+      clearSessionExemption(sessionState, id)
+      flushSessions()
+      recomputeWorkCapacity()
+      audit('SESSION_EXEMPT_CLEAR', id)
+      return sessionInfo(id)
+    },
+  }
 
   // ── ⑥ 配置页接口 ──
   withService('webServer', (c, wsSvc) => {
@@ -871,8 +1064,14 @@ export function apply(ctx, patchConfig = {}) {
       getMem: () => mem,
       getDataDir: () => dataDir,
       // 运行中实际生效的配置（页面用来对比文件值、标「待重载」）
-      getEffectiveConfig: () => cfg,
+      getEffectiveConfig: () => runCfg,
+      onConfigSaved: (next) => applyLiveConfig(next),
       getRunState: () => ({ ...runState(), injection: { ...injection } }),
+      sessions: sessionsApi,
+      star: {
+        payload: () => buildPayload({ dir: dataDir, layers: layersFromMemory(mem) }),
+        render: (payload) => renderHtml(payload, dataDir),
+      },
     })
     if (!api) throw new Error('webServer 不支持 register')
   })
@@ -916,30 +1115,39 @@ export function apply(ctx, patchConfig = {}) {
           const sysText = sysMsgs.map(messageText).join('\n')
 
           // ★ 注入块由插件自己按当前库实时构建（deriveMessages 里没有它，原因见 buildInjectedBlock 的注释）。
-          const block = buildInjectedBlock()
-          const blockReason = workMode ? 'work-mode' : (cfg.inject.enabled === false ? 'inject-disabled' : null)
+          const sid = ses?.id ? String(ses.id) : null
+          const persona = personaText()
+          const block = buildInjectedBlock(null, sid)
+          const blockReason = injection.reason
+          const reasonText = blockReason === 'work-mode'
+            ? '工作模式开启：不注入记忆'
+            : blockReason === 'session-exempt'
+              ? '该会话已豁免记忆接管：不注入记忆'
+              : blockReason === 'inject-disabled'
+                ? '注入已关闭'
+                : '注入开着，但库里还没有可注入的内容'
           const blockNote = block
             ? `${block.length.toLocaleString()} 字`
-            : blockReason === 'work-mode'
-              ? '0 字（工作模式：本轮不注入）'
-              : blockReason === 'inject-disabled'
-                ? '0 字（注入已关闭）'
-                : '0 字（注入开着，但库里还没有可注入的内容）'
+            : `0 字（${reasonText}）`
           const histNote = historyInj.length
             ? ` · 历史里另有 ${historyInj.length} 条旧记忆块（不重复写入）`
             : ''
           const regNote = regMsgs.length
             ? ` · 注册/配置类 ${regMsgs.length} 条（不写入）`
             : ''
-          const head = `系统提示 ${sysChars.toLocaleString()} 字 · 本轮记忆块 ${blockNote} · 其余 ${rest.length} 条 / ${restChars.toLocaleString()} 字${histNote}${regNote}`
-          // 文件里完整呈现：系统提示全文 + 本轮将注入的记忆块 + 历史残留 + 其余消息原样。
+          const modeNote = sid ? ` · 当前会话 ${sessionModeLabel(sid)}` : ''
+          const head = `系统提示 ${sysChars.toLocaleString()} 字 · 本轮人格 ${persona.length.toLocaleString()} 字 · 本轮记忆块 ${blockNote} · 其余 ${rest.length} 条 / ${restChars.toLocaleString()} 字${modeNote}${histNote}${regNote}`
+          // 文件里完整呈现：系统提示全文 + 人格 + 记忆块 + 历史残留 + 其余消息原样。
           // 注册类只在头部提示，不写入。
           const dump = [
             `【系统提示 · ${sysChars.toLocaleString()} 字】`,
             sysText,
             '',
+            `【本轮将注入的人格 · ${persona.length.toLocaleString()} 字】`,
+            persona || '（未配置人格）',
+            '',
             `【本轮将注入的记忆块 · ${block.length.toLocaleString()} 字】`,
-            block || `（${blockReason === 'work-mode' ? '工作模式开启：不注入记忆' : blockReason === 'inject-disabled' ? '注入已关闭' : '库里还没有可注入的内容'}）`,
+            block || `（${reasonText}）`,
             '',
             ...(historyInj.length
               ? [
@@ -1013,6 +1221,7 @@ export function apply(ctx, patchConfig = {}) {
       try { captureOff?.() } catch { /* 已卸 */ }
       try { mem.stop() } catch { /* 已停 */ }
       try { api?.dispose?.() } catch { /* 已卸 */ }
+      try { flushSessions() } catch { /* 已写 */ }
       for (const sid of [...buffers.keys()]) {
         Promise.resolve().then(() => flushBuffer(sid)).catch(() => {})
       }
@@ -1030,15 +1239,20 @@ export function apply(ctx, patchConfig = {}) {
     dataDir,
     writer,
     boot,
-    inject: { enabled: cfg.inject.enabled !== false, mode: injection.mode, ok: injection.ok, reason: injection.reason },
-    capture: captureOn,
-    compaction: { enabled: cfg.compaction.enabled !== false, keepTurns: Number(cfg.compaction.keepTurns) || 0 },
+    inject: { enabled: runCfg.inject.enabled !== false, mode: injection.mode, ok: injection.ok, reason: injection.reason },
+    capture: captureEnabled(),
+    compaction: { enabled: runCfg.compaction.enabled !== false, keepTurns: Number(runCfg.compaction.keepTurns) || 0 },
     workMode: {
-      enabled: workMode,
+      enabled: globalWorkDefault(),
+      perSession: true,
       hotChars: engineCfg.hotMaxChars,
       consolidateChars: engineCfg.consolidateMaxChars,
-      capture: { ...cap },
+      capture: { ...workCap() },
+      captureNormal: { ...normalCap() },
+      sessions: sessionStats(sessionState),
     },
+    persona: { enabled: runCfg.persona?.enabled !== false, chars: personaText().length, inSummary: runCfg.persona?.inSummary === true },
+    sessions: { path: sessionState.path || sessionsPath(env), ...sessionStats(sessionState) },
     semantic: { embed: !!caps.embed, rerank: !!caps.rerank, model: caps.embedModel || null },
     session: (() => { try { return session.info() } catch { return null } })(),
     stages: (() => {
@@ -1058,7 +1272,14 @@ export function apply(ctx, patchConfig = {}) {
   {
     const timer = setTimeout(() => {
       const now = apiInfo()
-      if (now.port) writeStatus(env, { api: now })
+      // ★ 同时补 star.url：首次写 status 时端口还是 0，url 只能是 null；
+      //   不补的话 status 里永远没有星图地址，设置页/脚本都拿不到入口。
+      if (now.port) {
+        writeStatus(env, {
+          api: now,
+          star: { url: `http://127.0.0.1:${now.port}/dsh-memory/star` },
+        })
+      }
     }, 1500)
     if (timer.unref) timer.unref()
   }
@@ -1066,7 +1287,7 @@ export function apply(ctx, patchConfig = {}) {
   if (boot.errors.length) audit('BOOT_DEGRADED', JSON.stringify(boot.errors).slice(0, 800))
   ctx.logger?.info?.('[memory-tiers] 装载完成：注入=%s 工具=%d 接口=%d 错误=%d',
     injection.mode, tools.length, api?.mounted?.length || 0, boot.errors.length)
-  return { boot, mem, llm, cfg, dataDir }
+  return { boot, mem, llm, cfg: runCfg, dataDir }
 }
 
 /**

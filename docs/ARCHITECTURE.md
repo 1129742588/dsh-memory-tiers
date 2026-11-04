@@ -13,7 +13,7 @@
 | **引擎（平台无关）** | `core/memory.mjs`（2311 行） | ✅ 原样搬——不 import 任何宿主 API，模型能力全靠依赖注入 |
 | **模型抽象** | `core/llm.mjs`（839 行） | ✅ 基本原样——只换 `createSessionCaller` 的实现 |
 | **配置 schema** | `core/settings.mjs`（967 行） | ✅ schema/校验/迁移思路照搬，存储介质按 astrbot 配置系统改 |
-| **配置页前端** | `core/client.mjs`（461 行） | ⚠️ 重写——注入 dsh web 的方式是平台特定的，UI 结构可复用 |
+| **配置页前端** | `core/client.mjs`（786 行） | ⚠️ 重写——注入 dsh web 的方式是平台特定的，UI 结构可复用；星图浮层依赖 dsh 插槽（见下） |
 | **宿主适配层** | `core/index.mjs`（1102 行） | ❌ 重写——九个接线点全部是 dsh 专属（见 §9 映射表） |
 
 一句话：**`memory.mjs + llm.mjs` 是「记忆系统」，`index.mjs` 是「记忆系统在 dsh 上的插法」**。移植 = 保留前者，重写后者。
@@ -31,7 +31,7 @@
                   │            index.mjs（接线层）              │
                   │  ① capture  ② 注入  ③ 压缩  ④ web API      │
                   └──────┬─────────────────────────────────────┘
-                         │ toEngineCfg()（51 项配置 → 引擎 cfg）
+                         │ toEngineCfg()（57 项配置 → 引擎 cfg）
                   ┌──────┴─────────────────────────────────────┐
                   │           memory.mjs（引擎）                │
                   │  organize 定时器 │ 分流 │ 融合 │ 遗忘 │ 视图 │
@@ -59,19 +59,21 @@
 
 ```
 core/
-  index.mjs      1102 行  宿主适配层（唯一 import 宿主 API 的文件）
-  memory.mjs     2311 行  引擎（平台无关，可整体移植）
-  llm.mjs         839 行  模型四阶段抽象
-  settings.mjs    967 行  配置 schema / 校验 / 迁移
-  client.mjs      461 行  配置页前端（注入 dsh web）
-  cordis.patch.yml  5 行  cordis 补丁：注册 service 到宿主
+  index.mjs      宿主适配层（唯一 import 宿主 API 的文件）：收/注入/压缩/会话模式/热改/接口
+  memory.mjs     引擎（平台无关，可整体移植）
+  llm.mjs        模型四阶段抽象（含可选的分流/分类人格前缀）
+  settings.mjs   配置 schema / 校验 / 迁移 / sessions.json / 配置页服务端接口
+  client.mjs     配置页、会话模式标记与星图浮层（注入 dsh web）
+  star.mjs       记忆星图页面与数据函数（插件内 /dsh-memory/star）
+  cordis.patch.yml  cordis 补丁：注册 service 到宿主
 tools/
-  preflight.mjs           34 项装机前检查
+  preflight.mjs           37 项装机前检查
   repair-sessions.mjs     会话修复（占位缺 id 的历史数据）
   inspect-session.mjs     会话解码取证
   collect-report.mjs      崩溃取证打包
   seed.mjs                冒烟种子库
-test/                     64 项单测（node --test）
+  star.mjs                星图开发 CLI（薄包装 core/star.mjs）
+test/                     72 项单测（node --test）
 ```
 
 ---
@@ -256,7 +258,7 @@ parts = []
 
 ## 6. 配置系统（settings.mjs）
 
-- **SCHEMA 是唯一真相源**：51 项，8 组（存储/抓取/注入/六层容量/整理节奏/模型/工作模式/历史替代），每项 path/label/hint/type/default/min/max。
+- **SCHEMA 是唯一真相源**：57 项，9 组（存储/抓取/注入/六层容量/整理节奏/模型/人格/工作模式/历史替代），每项 path/label/hint/type/default/min/max。`isReloadPath()` 标记哪些必须重载；其余保存后由 `applyLiveConfig()` 就地生效。
 - `coerce`：类型强制 + min/max 校验；越界字段**拒绝但其它字段照存**（`changed` 只回变化的键）。
 - 未知字段：**保留并进 `ignored`**（升级不留暗坑），绝静默丢弃。
 - v1 → v2 迁移：平面配置名映射（`V1_MEMORY_MAP`）+ 时间单位自动换算（`quietMs` → 分钟）。
@@ -265,27 +267,41 @@ parts = []
 
 ---
 
-## 7. 宿主适配层（index.mjs）与九个接线点
+## 7. 宿主适配层（index.mjs）与接线点
 
-启动九步（`step()` 逐项降级，任一失败记 `BOOT_FAIL` 继续装其余）：
+启动按 `step()` 逐项降级，任一失败记 `BOOT_FAIL` 继续装其余：
 
 | 步骤 | 做什么 | astrbot 对应物 |
 |---|---|---|
 | config | 读/迁移/校验配置 | astrbot 配置系统 |
-| model | `createLlm`（四阶段 caller） | astrbot LLM provider |
+| sessions | 读 `sessions.json`（工作模式/豁免） | 会话级状态存储 |
+| model | `createLlm`（四阶段 caller，带人格回调） | astrbot LLM provider |
 | memory | `createMemory`（引擎实例） | ✅ 原样 |
 | tools | 注册 5 个 `memory_*` 工具 | astrbot 工具/函数调用注册 |
-| capture | 订阅 `turn/end` 抓取 | astrbot 消息钩子 |
-| systemPrompt | `context()` 挂记忆块（INJECT_ON context） | astrbot 的 system prompt 注入点 |
-| inject:webServer | 配置页 web API 挂载 | astrbot 面板路由 |
+| capture | 订阅 `turn/end` 抓取（工作模式走骨架） | astrbot 消息钩子 |
+| systemPrompt | `context()` 挂人格(order 200) + 记忆块(order 250) | astrbot 的 system prompt 注入点 |
+| inject:webServer | 配置页/会话/星图 API 挂载 | astrbot 面板路由 |
 | commands | 注册 `/memory` 命令 | astrbot 指令系统 |
 | timers | organize 定时器 + 卸载清理 | 定时任务 |
 
 **turn 事件里做的事（每轮）**：`WRITE_TURN`（capture）→ 交叉校验（关注入却全替 → 警告）→ `COMPACT_OK`（历史替换占位，**必须带 `data.id`**）→ organize（定时器到点或轮末触发）。
 
-**web API**（配置页数据源）：`GET /api/config|status|running`、`POST /api/config|organize`、`GET /api/log`。
+**web API**（配置页/星图/会话标记数据源）：`GET /dsh-memory/api/config`、`GET /dsh-memory/api/state`、`GET /dsh-memory/api/log`、`POST /dsh-memory/api/organize`、`GET /dsh-memory/api/sessions`、`GET/POST /dsh-memory/api/session`、`GET /dsh-memory/star`、`GET /dsh-memory/star/data`。
 
-**注入方式**：记忆块作为独立的 `runtime-context` 消息进请求（宿主动态拼接）——注意 `deriveMessages()` **不含**注入块，调试「原样请求」只能靠 session 落盘数据或未来宿主提供的请求快照。
+**注入方式**：人格（context order 200）和记忆块（order 250）作为两条 `runtime-context` 消息进请求（宿主动态拼接）——注意 `deriveMessages()` **不含**注入块，调试「原样请求」只能靠 session 落盘数据或 `mem.buildBlock()` 正向构建。人格 provider 为空时 DSH 不贡献内容。
+
+**会话模式**：`sessions.json` 记录 `workMode/everWorked/turns`；`resolveSessionMode()` 单点判定 `work/exempt/normal`。注入与压缩都读同一个判定：`work`/`exempt` 跳过注入和历史替代，抓取用工作模式容量与骨架。全局 `workMode.enabled` 只是新会话默认值。
+
+**客户端 UI 的四个插槽**（`client.mjs` → `ctx.slots.inject`，全部 try/catch，旧宿主缺槽时逐级降级）：
+
+| 插槽 | 放什么 | 降级 |
+|---|---|---|
+| `settings.section` | 设置页「记忆」整节 | 无（这是基座） |
+| `conversation.input.right` | 输入框旁的工作模式标记 | 只少标记 |
+| `conversation.session.header.actions` | 会话顶栏「✦ 记忆星图」按钮 | 退回设置页按钮 |
+| `shell.overlay`（根 list 槽） | 星图近全屏浮层 + 左缘悬浮钮 | 退回设置页内嵌 iframe |
+
+星图浮层实测过的坑（Electron/dsh 特有，移植 astrbot 时不适用但思路同）：`window.open` 被静默拦截必须用页内 iframe；Windows 标题栏是 `-webkit-app-region:drag`，落进去的元素点击被窗口拖拽吃掉（元素要加 `no-drag`）；宿主浮层容器 `pointer-events:none` 需显式放行；主题变量以 `dsh-client-ui-theme` 实际定义为准（`--dsw-alias-bg-elevated`/`bg-hover` 不存在，用了必踩深色兜底）；面板让位标题栏用宿主变量 `--dsh-windows-titlebar-height`。Esc 分层退出：iframe 同源，捕获阶段监听并检查 `body.immersive`，沉浸中放行给星图页自己的 bubble 监听。
 
 ---
 
@@ -294,12 +310,15 @@ parts = []
 | 类别 | 事件 |
 |---|---|
 | 启动 | `BOOT_OK` `BOOT_FAIL` `BOOT_MISSING` `BOOT_DEGRADED` `BOOT_DONE` |
-| 配置 | `CONFIG_CREATED` `CONFIG_MIGRATED` `CONFIG_MIGRATE_FAIL` `CONFIG_BROKEN` `CONFIG_FILLED` `CONFIG_INVALID` `CONFIG_SAVED` `CONFIG_WRITE_FAIL` |
-| 抓取 | `WRITE_TURN` `WRITE_TURN_FAIL` `WRITE_TURN_SKIP` `BUFFER_TRUNCATED` `CAPTURE_ON` `CAPTURE_OFF` |
+| 配置 | `CONFIG_CREATED` `CONFIG_MIGRATED` `CONFIG_MIGRATE_FAIL` `CONFIG_BROKEN` `CONFIG_FILLED` `CONFIG_INVALID` `CONFIG_SAVED` `CONFIG_WRITE_FAIL` `CONFIG_APPLIED` `CONFIG_APPLY_FAIL` |
+| 会话 | `SESSION_MODE` `SESSION_EXEMPT` `SESSION_EXEMPT_CLEAR` `SESSIONS_BROKEN` `SESSIONS_WRITE_FAIL` |
+| 抓取 | `WRITE_TURN` `WRITE_TURN_FAIL` `WRITE_TURN_SKIP` `BUFFER_TRUNCATED` `CAPTURE_ON` `CAPTURE_OFF` `SKELETON` |
+| 人格 | `PERSONA_TRUNCATED` |
 | 注入 | `INJECT_ON` `INJECT_OFF` `INJECT_FAIL` `COMPACT_OK` `COMPACT_SKIP` |
 | 整理 | `ORGANIZE ok` `CLASSIFY n/n` `DIGEST[l1]` `DIGEST[l2]` `DIGEST_NO_MODEL` `DIGEST_FALLBACK` `DIGEST_EMPTY` |
 | 融合 | `FUSE_DUP` `FUSE_UPDATE` `SUPERSEDE` |
 | 遗忘 | `FORGET_ITEM` `FORGET_SUMMARY` `DL1_TRIM` |
+| 向量 | `VEC_LOAD_FAIL` `VEC_ITEM_BAD` `VEC_STALE` |
 | 其它 | `LAYER_WARN` `RELOCATE_LEGACY` `SEMANTIC_FAIL` `WORK_MODE` `SHUTDOWN` |
 
 grep 口径示例：`grep -E 'DIGEST\[|FUSE_|SUPERSEDE|FORGET|COMPACT_OK' ~/.dsh/memory-tiers/log.txt`。
@@ -386,3 +405,26 @@ grep 口径示例：`grep -E 'DIGEST\[|FUSE_|SUPERSEDE|FORGET|COMPACT_OK' ~/.dsh
 - time-context（时间戳）每轮必变，是未命中 600 的固定底噪（宿主行为，插件管不了）
 - 分流轮（L1/L2 大搬家 + L3 重算）一次性打断前缀缓存，约 1700 token 重置成本——分流频率低（L1 需涨 1500 字），可接受
 - npm 包历史上有一版 0.8.4 与 1.2.0 为坏内容（已 deprecate/标注），装机务必 1.2.1+
+
+### 11.1 向量文件的规模上限（实测，2026-11-04）
+
+向量是**单文件 base64 JSON**（`vectors/deep-part-0000.json` + `deep-meta.json`），加载时整体 `readFileSync(..., 'utf8')` → `JSON.parse` → 逐条 `Buffer.from(b64,'base64')` 转 `Float32Array`。
+
+| 向量条数 | 文件 | 启动加载 | 运行期重载 |
+|---|---|---|---|
+| 1 000 | 5 MB | 0.02 s | 0.02 s |
+| 5 000 | 26 MB | 0.10 s | 0.09 s |
+| 20 000 | 104 MB | 0.51 s | 0.52 s |
+| 50 000 | 261 MB | 1.15 s | 1.16 s |
+| 100 000 | 523 MB | **失败** | **失败** |
+
+- 耗时线性，约 **23 μs/条**（1024 维）。所以「加载慢」不是风险，**单文件体积才是**：
+- 523 MB 时 `readFileSync(...,'utf8')` 直接抛 **`ERR_STRING_TOO_LONG`**（V8 单字符串上限 `0x1fffffe8` ≈ 512 MB）→ 换算约 **9.5 万条 × 1024 维** 就是天花板
+- 这个失败原先被 `catch { return }` **静默吞掉**：向量表变空、语义检索退化成纯关键词，日志里什么都没有。现已改为记 `VEC_LOAD_FAIL`（含错误码、文件大小、原因摘要），**同一文件签名只记一次**，避免每次检索刷日志；单条解码失败汇总成 `VEC_ITEM_BAD n/m`
+- **分片方案暂不做**：文件名 `deep-part-0000` 预留了分片位，但代码只读 `part-0000`。真要扩容，优先级更高的是改存储格式（Float32 直存二进制，省 33% 体积、可流式读、不受字符串上限约束），分片是它之后的事
+- 真实库当前 504 条 / 2.7 MB，距上限约 190 倍，短期无风险
+
+顺带记录检索侧的两个规模阈值（同日实测，summary 深度、纯本地）：
+
+- DL3 条数 ≤ 5 万时热检索 40 ms 以内；到 10 万条（`DL3.json` = 64 MB）正好撞上 `cacheMaxFileBytes`（64 MB）→ 整层不再缓存、每次重新解析，跳到 667 ms
+- 检索耗时与库大小基本无关的另一半原因是：模型侧只有 embed 1 次 + rerank 1 次（候选固定 `limit×2` 条），输入规模是常数。所以线上感知到的十几秒只会来自模型服务延迟/重试，不是库变大

@@ -40,6 +40,7 @@ export function dshHome(env = process.env) {
 /** 配置目录（固定；配置、日志、状态、上下文导出都在这里） */
 export const configDir = (env = process.env) => join(dshHome(env), 'memory-tiers')
 export const configPath = (env = process.env) => join(configDir(env), 'config.json')
+export const sessionsPath = (env = process.env) => join(configDir(env), 'sessions.json')
 export const logPath = (env = process.env) => join(configDir(env), 'log.txt')
 export const statusPath = (env = process.env) => join(configDir(env), 'status.json')
 export const contextPath = (env = process.env) => join(configDir(env), 'context.txt')
@@ -253,37 +254,68 @@ export const SCHEMA = [
     hint: '分流另有一套更长的超时（90 秒），这里管嵌入/精排/融合。',
   },
 
+  // —— 人格 ——
+  {
+    group: '人格', path: 'persona.enabled', type: 'boolean', default: true,
+    label: '注入人格',
+    hint: '把下面的人格设定放在系统提示词之后、记忆块之前。关掉后配置正文和外部插件片段都不生效。空内容不注入，不留空行。',
+  },
+  {
+    group: '人格', path: 'persona.text', type: 'textarea', default: '', wide: true,
+    label: '人格设定',
+    hint: '逐字稳定，不要写时间戳或每轮会变的内容（会打断前缀缓存）。其它插件也可以通过 memoryTiersPersona 服务追加片段。',
+  },
+  {
+    group: '人格', path: 'persona.inSummary', type: 'boolean', default: false,
+    label: '分流/分类时也带人格',
+    hint: '只影响「怎么总结」的口径，不改变三档判定标准；人格只是临时前缀，不写进摘要正文。默认关，和上面的注入开关独立。',
+  },
+
   // —— 工作模式 ——
   {
     group: '工作模式', path: 'workMode.enabled', type: 'boolean', default: false,
-    label: '工作模式（专注干活）',
-    hint: '开启后：不注入记忆、不压缩历史（会话表现完全正常），但照常记录与整理，纪录字数按下面这组更大的值截断。'
-      + '⚠️ 切换本项需重载插件才生效。',
+    label: '工作模式（新会话默认开启）',
+    hint: '全局默认值：新会话默认不注入记忆、不压缩历史，但照常记录与整理。单个会话可在输入框旁随时切换；切换本项本身需重载插件。',
   },
   {
     group: '工作模式', path: 'workMode.userChars', type: 'number', default: 4000, min: 100, max: 20000, step: 100,
     label: '工作模式：单条用户消息上限（字）',
-    hint: '只在工作模式开启时生效（比普通抓取更完整）。改完重载插件生效。',
+    hint: '只在工作模式开启时生效（比普通抓取更完整）。改完保存即生效。',
   },
   {
     group: '工作模式', path: 'workMode.botChars', type: 'number', default: 800, min: 100, max: 5000, step: 50,
     label: '工作模式：一轮回复上限（字）',
-    hint: '只在工作模式开启时生效。改完重载插件生效。',
+    hint: '只在工作模式开启时生效。改完保存即生效。',
   },
   {
     group: '工作模式', path: 'workMode.toolChars', type: 'number', default: 1200, min: 0, max: 5000, step: 50,
     label: '工作模式：单条工具输出上限（字）',
-    hint: '只在工作模式开启时生效（工具输出记得更全）。改完重载插件生效。',
+    hint: '只在工作模式开启时生效（工具输出记得更全）。改完保存即生效。',
   },
   {
     group: '工作模式', path: 'workMode.hotChars', type: 'number', default: 6000, min: 200, max: 100000, step: 100,
     label: '工作模式：L1 容量（字）',
-    hint: '只在工作模式开启时生效。改完重载插件生效。',
+    hint: '只在存在工作模式/已豁免会话时生效（共享 L1）。改完保存即生效。',
   },
   {
     group: '工作模式', path: 'workMode.consolidateChars', type: 'number', default: 5000, min: 200, max: 100000, step: 100,
     label: '工作模式：L2 容量（字）',
-    hint: '只在工作模式开启时生效。改完重载插件生效。',
+    hint: '只在存在工作模式/已豁免会话时生效。改完保存即生效。',
+  },
+  {
+    group: '工作模式', path: 'workMode.skeleton.enabled', type: 'boolean', default: true,
+    label: '工作模式记忆先压成骨架',
+    hint: '进 L1 前只留时间/地点/人物/事件/做了什么；命令输出和过程噪音不进记忆。纯规则截断，不调模型。',
+  },
+  {
+    group: '工作模式', path: 'workMode.skeleton.userChars', type: 'number', default: 240, min: 50, max: 2000, step: 20,
+    label: '骨架：请求保留字数', showIf: { path: 'workMode.skeleton.enabled', eq: true },
+    hint: '一条请求压成一句话保留，超出截断。',
+  },
+  {
+    group: '工作模式', path: 'workMode.skeleton.botChars', type: 'number', default: 200, min: 50, max: 2000, step: 20,
+    label: '骨架：结论保留字数', showIf: { path: 'workMode.skeleton.enabled', eq: true },
+    hint: '只留最后一段结论，代码块和过程文字不要。',
   },
 
   // —— 历史替代（第 7 步）——
@@ -308,10 +340,21 @@ export const SCHEMA = [
 const BY_PATH = new Map(SCHEMA.map((f) => [f.path, f]))
 
 /**
+ * 哪些字段必须重载插件才生效：模型通道（llm 实例在启动时建好）、
+ * 存储目录/写者（引擎在启动时建好）、全局工作模式默认值、定时器间隔。
+ * 其余字段保存后由 index.applyLiveConfig() 就地生效。
+ */
+const RELOAD_PATHS = new Set(['storage.dir', 'writer', 'workMode.enabled', 'organize.everyMin'])
+export function isReloadPath(path) {
+  const p = String(path || '')
+  return p.startsWith('model.') || RELOAD_PATHS.has(p)
+}
+
+/**
  * 配置页的分组顺序（作者口径）：模型连接放最前——必填的 apiKey 不该让人滚半页才找到。
  * 没列到的分组排在最后（以后新增分组不会丢）。
  */
-export const GROUP_ORDER = ['模型', '工作模式', '存储', '抓取', '注入', '六层容量', '整理节奏', '历史替代']
+export const GROUP_ORDER = ['模型', '人格', '工作模式', '存储', '抓取', '注入', '六层容量', '整理节奏', '历史替代']
 
 export const GROUPS = [...new Set(SCHEMA.map((f) => f.group))]
   .sort((a, b) => {
@@ -454,7 +497,7 @@ export function normalize(raw, env = process.env) {
   const workModeOn = getPath(config, 'workMode.enabled') === true
   if (workModeOn) {
     // 工作模式本来就强制关注入 + 关压缩，这时不该再报「模型什么都看不到」
-    warnings.push({ path: 'workMode.enabled', error: '工作模式开启：重载插件后注入与压缩会被强制关闭（两个开关的值保留，退出工作模式后恢复）' })
+    warnings.push({ path: 'workMode.enabled', error: '全局默认工作模式开启：新会话默认不注入、不压缩历史；单个会话可在输入框旁切换。本项需重载插件才对新的默认值生效。' })
   } else if (getPath(config, 'inject.enabled') === false && getPath(config, 'compaction.keepTurns') === 0) {
     warnings.push({ path: 'inject.enabled', error: '注入关着、历史又全部替换：模型将看不到任何历史与记忆' })
   }
@@ -690,7 +733,11 @@ export function saveConfig(patch, opts = {}) {
   }
   return {
     ok: true, changed, errors, warnings, ignored: n.ignored,
-    config: next, path: cur.path, needRestart: changed.length > 0,
+    config: next, path: cur.path,
+    applied: changed.filter((p) => !isReloadPath(p)),
+    needReload: changed.filter((p) => isReloadPath(p)),
+    // 兼容旧页面/旧测试：只要有一项必须重载就是 true
+    needRestart: changed.some((p) => isReloadPath(p)),
   }
 }
 
@@ -723,11 +770,147 @@ export function diffPaths(fileCfg, effectiveCfg) {
   return out
 }
 
+// ============================================================
+// 会话状态（工作模式按会话 + 接管豁免名单）
+//
+// 独立于 config.json：跨重启、跨插件升级都保留；坏了只重建这个文件，
+// 绝不动记忆库。名单含义：everWorked && turns>0 的会话，即使之后关掉
+// 工作模式，也不再做历史替代压缩与记忆注入（相当于仍处于工作模式）。
+// ============================================================
+
+export const SESSIONS_VERSION = 1
+
+function freshSessions() {
+  return { version: SESSIONS_VERSION, updatedAt: 0, sessions: {} }
+}
+
+function normalizeSessionRecord(rec) {
+  const r = rec && typeof rec === 'object' ? rec : {}
+  return {
+    workMode: r.workMode === true ? true : r.workMode === false ? false : null,
+    everWorked: r.everWorked === true,
+    turns: Math.max(0, Math.trunc(Number(r.turns) || 0)),
+    lastActiveAt: Number(r.lastActiveAt) || 0,
+    ...(r.clearedAt ? { clearedAt: Number(r.clearedAt) } : {}),
+  }
+}
+
+/** 读 sessions.json；缺失 = 空名单，损坏 = 改名留档后重建 */
+export function loadSessions(opts = {}) {
+  const env = opts.env || process.env
+  const log = typeof opts.log === 'function' ? opts.log : () => {}
+  const p = sessionsPath(env)
+  let raw = null
+  try {
+    if (existsSync(p)) raw = JSON.parse(readFileSync(p, 'utf8').replace(/^\uFEFF/, ''))
+  } catch (e) {
+    const bad = `${p}.broken-${Date.now()}`
+    try { renameSync(p, bad) } catch { /* 挪不动就重建内存态 */ }
+    log('SESSIONS_BROKEN', `坏文件已改名 ${bad}：${e?.message ?? e}`)
+    raw = null
+  }
+  const state = freshSessions()
+  state.path = p
+  if (raw && typeof raw === 'object' && raw.sessions && typeof raw.sessions === 'object') {
+    state.updatedAt = Number(raw.updatedAt) || 0
+    for (const [sid, rec] of Object.entries(raw.sessions)) {
+      if (!sid || !rec || typeof rec !== 'object') continue
+      state.sessions[String(sid)] = normalizeSessionRecord(rec)
+    }
+  }
+  return state
+}
+
+/** 原子写；失败只记日志，返回 false（内存态仍可用） */
+export function saveSessions(state, opts = {}) {
+  const env = opts.env || process.env
+  const log = typeof opts.log === 'function' ? opts.log : () => {}
+  const p = state?.path || sessionsPath(env)
+  const body = {
+    version: SESSIONS_VERSION,
+    updatedAt: Date.now(),
+    sessions: state?.sessions && typeof state.sessions === 'object' ? state.sessions : {},
+  }
+  try {
+    atomicWrite(p, JSON.stringify(body, null, 2))
+    state.updatedAt = body.updatedAt
+    return true
+  } catch (e) {
+    log('SESSIONS_WRITE_FAIL', String(e?.message ?? e))
+    return false
+  }
+}
+
+/**
+ * 单点模式判定：work / exempt / normal。
+ * - work：显式开启，或没有显式选择时跟随全局默认；
+ * - exempt：开过工作模式且确实对话过，现在虽已关闭，但仍不做接管；
+ * - normal：其余（是否注入/压缩还要看 inject/compaction 开关）。
+ */
+export function resolveSessionMode(state, sessionId, globalWork = false) {
+  const sid = String(sessionId || '')
+  const rec = sid ? state?.sessions?.[sid] : null
+  if (rec?.workMode === true) return 'work'
+  if (rec?.workMode === false) return rec.everWorked && rec.turns > 0 ? 'exempt' : 'normal'
+  if (globalWork === true) return 'work'
+  return rec?.everWorked && rec?.turns > 0 ? 'exempt' : 'normal'
+}
+
+/** 设置某会话的显式工作模式；关闭时不清 everWorked（豁免由此保留） */
+export function setSessionWorkMode(state, sessionId, workMode) {
+  const sid = String(sessionId || '').trim()
+  if (!sid) return null
+  const rec = state.sessions[sid] || normalizeSessionRecord({})
+  rec.workMode = workMode === true
+  state.sessions[sid] = rec
+  return rec
+}
+
+/** 手工解除接管豁免；保留 turns 统计，只清 everWorked 与显式开关 */
+export function clearSessionExemption(state, sessionId) {
+  const sid = String(sessionId || '').trim()
+  if (!sid) return null
+  const rec = state.sessions[sid] || normalizeSessionRecord({})
+  rec.everWorked = false
+  rec.workMode = false
+  rec.clearedAt = Date.now()
+  state.sessions[sid] = rec
+  return rec
+}
+
+/** 记一轮真人对话；工作模式/已豁免状态下要标记 everWorked（豁免的依据） */
+export function recordSessionTurn(state, sessionId, { wasWorkLike = false } = {}) {
+  const sid = String(sessionId || '').trim()
+  if (!sid) return null
+  // 普通会话不落名单：只有「开过/正在工作模式」的会话才需要记轮次（豁免的依据）。
+  // 这样 sessions.json 不会随所有会话无限增长。
+  if (!state.sessions[sid] && !wasWorkLike) return null
+  const rec = state.sessions[sid] || normalizeSessionRecord({})
+  rec.turns += 1
+  rec.lastActiveAt = Date.now()
+  if (wasWorkLike) rec.everWorked = true
+  state.sessions[sid] = rec
+  return rec
+}
+
+/** 给页面/状态用：只读摘要 */
+export function sessionStats(state) {
+  const out = { total: 0, work: 0, exempt: 0, normal: 0 }
+  for (const rec of Object.values(state?.sessions || {})) {
+    out.total++
+    if (rec.workMode === true) out.work++
+    else if (rec.everWorked && rec.turns > 0) out.exempt++
+    else out.normal++
+  }
+  return out
+}
+
 /** 页面需要的字段定义（去掉服务端内部字段） */
 export function publicSchema() {
   return SCHEMA.map((f) => ({
     group: f.group, path: f.path, type: f.type, label: f.label,
     hint: f.hint || '', wide: !!f.wide,
+    reload: isReloadPath(f.path),
     ...(f.min !== undefined ? { min: f.min } : {}),
     ...(f.max !== undefined ? { max: f.max } : {}),
     ...(f.step !== undefined ? { step: f.step } : {}),
@@ -752,13 +935,14 @@ const minutesToMs = (v, dflt) => {
  * ★ 全工程只有这一处做映射：以后改配置结构只动这里和 SCHEMA，
  *   不会再出现「配置写在 A、代码读 B」那种悄悄失效。
  */
-export function toEngineCfg(cfg) {
+export function toEngineCfg(cfg, opts = {}) {
   const g = (p, d) => {
     const v = getPath(cfg, p)
     return v === undefined || v === null ? d : v
   }
-  // 工作模式：用专属的更大容量覆盖普通值（只在开启时生效）
-  const work = getPath(cfg, 'workMode.enabled') === true
+  // 工作模式：用专属的更大容量覆盖普通值。
+  // 共享 L1 下，只要存在任一工作模式/已豁免会话，index 会传 opts.workMode=true。
+  const work = opts.workMode !== undefined ? opts.workMode === true : getPath(cfg, 'workMode.enabled') === true
   const hotChars = work ? g('workMode.hotChars', 6000) : g('layers.hotChars', 3000)
   const consolidateChars = work ? g('workMode.consolidateChars', 5000) : g('layers.consolidateChars', 2500)
   const botChars = work ? g('workMode.botChars', 800) : g('capture.botChars', 400)
@@ -915,10 +1099,21 @@ export function installApi(ctx, opts = {}) {
     try { body = JSON.parse(raw || '{}') } catch { json(res, 400, { ok: false, error: 'JSON 解析失败' }); return }
     const r = saveConfig(body, { env, log })
     if (!r.ok) { json(res, 400, { ok: false, error: r.errors?.[0]?.error || '保存失败', errors: r.errors }); return }
+    // 能热改的当场换进运行态；必须重载的留给页面标「待重载」。
+    let applyError = null
+    if (typeof opts.onConfigSaved === 'function') {
+      try { opts.onConfigSaved(r.config, r.changed) } catch (e) {
+        applyError = String(e?.message ?? e)
+        log('CONFIG_APPLY_FAIL', applyError)
+      }
+    }
     const { config } = maskSecrets(r.config)
     json(res, 200, {
       ok: true,
       changed: r.changed,
+      applied: r.applied,
+      needReload: r.needReload,
+      applyError,
       // 有些字段没通过校验被跳过（比如填了 70 的 0~1 参数）：整次保存不算失败，
       // 但必须把「哪几项没存」告诉页面，否则就是「保存成功但没变」。
       errors: r.errors,
@@ -959,6 +1154,67 @@ export function installApi(ctx, opts = {}) {
     const r = await mem.organize()
     json(res, 200, { ok: true, result: r })
   })
+
+  // 记忆星图：挂插件已有的 webServer，不另起端口；数据由 index 从引擎内存取。
+  if (opts.star && typeof opts.star.payload === 'function' && typeof opts.star.render === 'function') {
+    route('exact', '/dsh-memory/star', async (req, res) => {
+      if (req.method !== 'GET') { json(res, 405, { ok: false, error: '只接受 GET' }); return }
+      const payload = opts.star.payload()
+      res.statusCode = 200
+      res.setHeader('content-type', 'text/html; charset=utf-8')
+      res.setHeader('cache-control', 'no-store')
+      res.end(opts.star.render(payload))
+    })
+    route('exact', '/dsh-memory/star/data', async (req, res) => {
+      if (req.method !== 'GET') { json(res, 405, { ok: false, error: '只接受 GET' }); return }
+      json(res, 200, opts.star.payload())
+    })
+  }
+
+  // 会话状态：输入框旁的模式标记与设置页的豁免名单共用。
+  if (opts.sessions) {
+    const api = opts.sessions
+    route('exact', '/dsh-memory/api/sessions', async (req, res) => {
+      if (req.method !== 'GET') { json(res, 405, { ok: false, error: '只接受 GET' }); return }
+      json(res, 200, { ok: true, ...(api.list?.() || { sessions: [] }) })
+    })
+    route('exact', '/dsh-memory/api/session', async (req, res) => {
+      if (req.method === 'GET') {
+        let sid = ''
+        try { sid = new URL(req.url, 'http://127.0.0.1').searchParams.get('sessionId') || '' } catch { /* 坏 query 当空 */ }
+        if (!sid) { json(res, 400, { ok: false, error: '缺 sessionId' }); return }
+        json(res, 200, { ok: true, ...(api.get?.(sid) || {}) })
+        return
+      }
+      if (req.method !== 'POST') { json(res, 405, { ok: false, error: '只接受 GET / POST' }); return }
+      const raw = await readBody(req)
+      let body
+      try { body = JSON.parse(raw || '{}') } catch { json(res, 400, { ok: false, error: 'JSON 解析失败' }); return }
+      const sid = String(body.sessionId || '').trim()
+      const action = String(body.action || '').trim()
+      if (!sid) { json(res, 400, { ok: false, error: '缺 sessionId' }); return }
+      if (action === 'work-on') {
+        api.setMode?.(sid, true)
+      } else if (action === 'work-off') {
+        api.setMode?.(sid, false)
+      } else if (action === 'clear-exemption') {
+        if (body.confirm !== true) {
+          json(res, 400, {
+            ok: false,
+            error: '解除接管豁免会让该会话恢复记忆接管：下一轮可能把现有历史压缩成一条占位，历史可能被压到 0。请二次确认。',
+            needConfirm: true,
+          })
+          return
+        }
+        api.clearExemption?.(sid)
+        log('SESSION_EXEMPT_CLEAR', sid)
+      } else {
+        json(res, 400, { ok: false, error: 'action 只能是 work-on / work-off / clear-exemption' })
+        return
+      }
+      json(res, 200, { ok: true, ...(api.get?.(sid) || {}) })
+    })
+  }
 
   return {
     mounted,

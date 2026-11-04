@@ -813,6 +813,7 @@ export function createMemory(o = {}) {
   let vectors = new Map()
   let vectorsDirty = false
   let vecSig = ''
+  let lastVecFail = ''   // 上次记录过的加载失败摘要（同签名只记一次，防刷日志）
 
   function vecFileSig() {
     try { const st = statSync(vecPath); return `${st.mtimeMs}:${st.size}` } catch { return '' }
@@ -840,13 +841,31 @@ export function createMemory(o = {}) {
       return
     }
     let raw
-    try { raw = JSON.parse(readFileSync(vecPath, 'utf8')) } catch { return }
+    try {
+      raw = JSON.parse(readFileSync(vecPath, 'utf8'))
+    } catch (e) {
+      // 读不动就是读不动：太大（ERR_STRING_TOO_LONG，单文件超过 V8 字符串上限约 512MB）、
+      // JSON 损坏、权限问题都在这里。**必须留痕**——否则向量表悄悄变空，
+      // 语义检索静默退化成纯关键词，用户只会觉得"最近搜不准了"，查不出原因。
+      // 同一个文件签名只报一次，避免每次检索都写日志把 log.txt 刷爆。
+      const st = (() => { try { return statSync(vecPath).size } catch { return 0 } })()
+      const sizeTxt = st >= 1024 * 1024 ? `${(st / 1024 / 1024).toFixed(0)}MB` : `${Math.round(st / 1024)}KB`
+      const brief = `VEC_LOAD_FAIL ${e?.code || ''} size=${sizeTxt} ${String(e?.message ?? e).slice(0, 100)}`
+      if (brief !== lastVecFail) {
+        lastVecFail = brief
+        audit(`${brief}（向量不可用：语义检索退化为关键词匹配）`)
+      }
+      return
+    }
+    lastVecFail = ''
+    let bad = 0
     for (const [id, b64] of Object.entries(raw || {})) {
       try {
         const buf = Buffer.from(b64, 'base64')
         vectors.set(id, new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4))
-      } catch { /* 单条坏了不连累别人 */ }
+      } catch { bad++ /* 单条坏了不连累别人 */ }
     }
+    if (bad) audit(`VEC_ITEM_BAD ${bad}/${Object.keys(raw || {}).length} 条解码失败（已跳过）`)
   }
 
   function saveVectors() {
@@ -2294,6 +2313,12 @@ export function createMemory(o = {}) {
     timer = null
   }
 
+  /** 配置热改：只覆盖引擎认得的键；定时器间隔不在这里重排（everyMin 需要重载）。 */
+  function updateConfig(patch = {}) {
+    if (patch && typeof patch === 'object') Object.assign(cfg, patch)
+    return cfg
+  }
+
   loadVectors()
 
   return {
@@ -2302,7 +2327,7 @@ export function createMemory(o = {}) {
     // 读
     buildBlock, search, list, stats, graveyard,
     // 维护
-    organize, start, stop,
+    organize, start, stop, updateConfig,
     // 信号
     attend, pin, forget,
     // 调试/测试用的最小集合

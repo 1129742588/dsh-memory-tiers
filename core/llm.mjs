@@ -549,6 +549,20 @@ export function createLlm(options = {}) {
   const onLog = typeof cfg.onLog === 'function' ? cfg.onLog : null
   const log = (kind, detail) => { try { onLog?.(kind, detail) } catch { /* 日志失败不影响主流程 */ } }
   const getSession = typeof cfg.getSession === 'function' ? cfg.getSession : () => null
+  const getPersona = typeof cfg.getPersona === 'function' ? cfg.getPersona : () => ''
+  const personaInSummary = typeof cfg.personaInSummary === 'function' ? cfg.personaInSummary : () => false
+
+  /**
+   * 人格只做「分流/分类」的临时 system 前缀：不改 user、不改解析器、
+   * 不写进摘要正文。默认关（persona.inSummary）。
+   */
+  function withPersona(system) {
+    try {
+      if (!personaInSummary()) return system
+      const p = String(getPersona() || '').trim()
+      return p ? `${p}\n\n${system}` : system
+    } catch { return system }
+  }
 
   const STAGES = ['embed', 'rerank', 'chat', 'summary']
 
@@ -716,7 +730,7 @@ export function createLlm(options = {}) {
       : buildL1Prompt(args)
 
     try {
-      const out = await chat(prompt.sys, prompt.user, {
+      const out = await chat(withPersona(prompt.sys), prompt.user, {
         maxTokens: Math.min(300 + 12 * list.length, 4000),
         temperature: 0.2, stage: 'summary', timeout: cfg.summaryTimeoutMs, thinking: false,
       })
@@ -730,7 +744,7 @@ export function createLlm(options = {}) {
     const body = String(text || '').trim()
     if (!body) return null
     try {
-      const out = await chat(CLASSIFY_SYS, `记忆：${body}`, { maxTokens: 300 })
+      const out = await chat(withPersona(CLASSIFY_SYS), `记忆：${body}`, { maxTokens: 300 })
       const j = parseJson(out)
       if (!j) return null
       const imp0 = Number(j.importance)
@@ -758,7 +772,7 @@ export function createLlm(options = {}) {
       const idx = need.slice(start, start + chunk)
       const payload = idx.map((i, k) => `${k + 1}. ${list[i]}`).join('\n')
       try {
-        const raw = await chat(CLASSIFY_BATCH_SYS, payload, { maxTokens: 200 + idx.length * 60 })
+        const raw = await chat(withPersona(CLASSIFY_BATCH_SYS), payload, { maxTokens: 200 + idx.length * 60 })
         const arr = parseJson(raw)
         if (!Array.isArray(arr)) { log('MODEL_BAD_JSON', `stage=classifyBatch n=${idx.length}`); continue }
         const hasI = arr.some((x) => x && typeof x === 'object' && 'i' in x)
