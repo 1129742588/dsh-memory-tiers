@@ -478,7 +478,7 @@ window.__ModuleLoader__.load({
       const wm = run.workMode || {}
       const compactionOn = run.config?.compaction?.enabled !== false
       const keepTurns = Number(run.config?.compaction?.keepTurns) || 0
-      const injectText = run.injection?.mode === 'context' ? '每轮'
+      const injectText = run.injection?.mode === 'context' ? '每轮（用户消息前）'
         : run.injection?.mode === 'section' ? '每轮（旧接口）'
           : run.injection?.reason === 'work-mode' ? '关（工作模式）'
             : run.injection?.mode === 'off' ? '关' : '没挂上'
@@ -546,7 +546,7 @@ window.__ModuleLoader__.load({
             h('td', null, inCtx ? h('span', { className: 'dmt-tag' }, '是') : '—'),
           )))),
         h('div', { className: 'dmt-hint', style: { marginTop: '6px' } },
-          '注入：' + (run.injection?.mode === 'context' ? '已挂上（每轮更新）'
+          '注入：' + (run.injection?.mode === 'context' ? '已挂上（用户消息前，每轮更新）'
             : run.injection?.mode === 'section' ? '已挂上（旧接口）'
               : run.injection?.mode === 'off' ? (run.injection?.reason === 'work-mode' ? '工作模式：关闭' : '已关闭') : '没挂上')
           + ' · 自动记录：' + (run.config?.capture === false ? '关闭' : '开启')

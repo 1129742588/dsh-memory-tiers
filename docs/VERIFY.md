@@ -1,4 +1,4 @@
-﻿# dsh-memory-tiers 实机验证手册
+# dsh-memory-tiers 实机验证手册
 
 > **给执行的 agent**：这份手册是「照着做就能得出结论」的清单，不是背景介绍。
 > 每一步都给了「怎么造 / 看什么 / 期望什么 / 失败看哪里」。
@@ -24,7 +24,7 @@
 | 记忆库（默认） | `<DSH_HOME>/storages/memory` |
 | `DSH_HOME` | 环境变量有就用，否则 `~/.dsh` |
 | 工具 | `tools/preflight.mjs`、`tools/inspect-session.mjs`、`tools/collect-report.mjs`、`tools/seed.mjs` |
-| 测试 | `test/`（72 项，不需要 dsh） |
+| 测试 | `test/`（76 项，不需要 dsh） |
 
 **不要做**：改 `core/` 里的代码、删用户的记忆库、把真实 API Key 贴进报告（`collect-report` 会自动打码，但手工贴日志时注意）。
 **需要重载插件**：新代码、配置页的新前端，都要重启才生效。如果你没有重启权限，做到 §2 为止，把剩下的交给用户。
@@ -33,7 +33,7 @@
 
 ### 0.1 怎么确认「跑的是新代码，不是旧插件」
 
-| 看什么 | 新代码（1.3.0） | 旧插件（0.9.x） |
+| 看什么 | 新代码（1.3.1） | 旧插件（0.9.x） |
 |---|---|---|
 | 配置文件 | `<DSH_HOME>/memory-tiers/config.json`（有 `version: 2`、`storage.dir`、`layers.*`） | `<DSH_HOME>/memory-tiers.json`（有 `layout`、`memoryCfg`） |
 | 状态文件 | `<DSH_HOME>/memory-tiers/status.json`（有 `statusVersion`、`boot.steps`） | `<DSH_HOME>/memory-tiers.status.json` |
@@ -68,7 +68,7 @@ cd D:\Tempfile\dsh-memory-tiers
 # ① 37 项装机前检查（文件清单、独立 import、配置往返、引擎冒烟）
 node tools\preflight.mjs
 
-# ② 72 项单元/流程测试
+# ② 76 项单元/流程测试
 node --test 'test/*.test.mjs'
 
 # ③ 看注入块长什么样（造一份假库，不碰真数据）
@@ -376,7 +376,7 @@ Select-String -Path (Join-Path $dshHome 'memory-tiers\log.txt') -Pattern 'COMPAC
 
 **PASS 条件**：
 
-- `压缩 ✅ 有 N 条占位`，且占位文本是「此前 K 轮对话已归档到长期记忆…」；
+- `压缩 ✅ 有 N 条占位`，且占位文本固定为「（历史已归档到长期记忆）」；不随轮数变化；
 - 日志有 `COMPACT_OK removed=… rounds=… archived=…`；
 - **关键**：模型这边依然能引用 5.1 写的 `ALPHA-731`（说明历史没了、记忆还在）。
 
@@ -491,19 +491,22 @@ node D:\Tempfile\dsh-memory-tiers\tools\repair-sessions.mjs --apply   # 补 id�
 
 ---
 
-## 10. 1.3.0 新增验收（10 分钟）
+## 10. 1.3.1 新增验收（10 分钟）
 
 | # | 动作 | 判定 |
 |---|---|---|
 | 1 | 设置页点「打开记忆星图」；换 `storage.dir` 重载后再开 | 页面能开；数据跟新库；没有 8902 端口；边写边刷新不闪 |
-| 2 | 配置页填一段人格 → `/memory context` | 顺序是「系统提示 → 人格 → 记忆块」；关掉人格后没有空白段 |
+| 2 | 配置页填一段人格 → `/memory context` | 顺序是「系统提示 → 人格 → 稳定环境段 → 记忆块 → 端口块」，且写明落位在用户消息前 |
 | 3 | 输入框旁标记：会话 A 开工作模式 → 聊两句 → 关掉 | A 显示「工作模式 · 已豁免」；继续聊，历史仍在；B 显示「记忆接管」不受影响 |
 | 4 | 设置页解除 A 的豁免 | 先出现风险提示，再点确认才解除；解除后 A 恢复注入/接管 |
 | 5 | 重启 dsh（或重载插件）后看 `sessions.json` | A 的豁免仍在 |
 | 6 | 工作模式连跑几轮 | 日志有 `SKELETON`；L1 是每条轮次一条骨架，不含工具输出/参数；DL2 增长变慢 |
 | 7 | 改 `layers.hotChars` 保存 | 提示「立即生效」；下一轮整理按新值 |
 | 8 | 改 `model.summaryChunk` 保存 | 提示「需重载」；页面标「待重载」；运行值不变 |
-| 9 | 带人格连发 3–5 轮 | 缓存未命中稳定低位、不随轮数累积（正常会话仍 500–800 量级） |
+| 9 | 新开普通会话，连发 4 轮 | session 日志里每轮 `runtime-context` 的 seq < 本轮 `user` 的 seq；快照顺序是人格 → 稳定环境段 → 记忆块 → web_surface |
+| 10 | 看第 3–5 轮 usage | `cacheRead` 从约 9,088 涨到 13,500 以上；未命中稳定在 **150–250 token**，不随轮数累积 |
+| 11 | 看压缩占位 | 普通模式占位固定为「（历史已归档到长期记忆）」，不带轮数；工作模式没有占位 |
+| 12 | 看日志 `INJECT_ORDER skill-catalog-first count=1 chars≈1576` | 出现即说明技能目录已前置；会话里 `skill-catalog` 的 seq 应早于 `runtime-context` |
 
 ---
 
@@ -511,7 +514,7 @@ node D:\Tempfile\dsh-memory-tiers\tools\repair-sessions.mjs --apply   # 补 id�
 
 | 事件 | 含义 / 看到它说明什么 |
 |---|---|
-| `BOOT_OK <step>` | 某一步装载成功（config / model / memory / tools / capture / systemPrompt / webServer / commands / timers） |
+| `BOOT_OK <step>` | 某一步装载成功（config / sessions / model / memory / tools / capture / systemPrompt / inject-order / webServer / commands / timers） |
 | `BOOT_FAIL <step> …` | 某一步失败；插件继续装其余部分 |
 | `BOOT_MISSING <service>` | 服务一直没来（或看门狗超时）——设置页/命令没挂上时看这个 |
 | `BOOT_DONE ms=… steps=… errors=N` | 装载结束；`errors=0` 才是干净启动 |
@@ -593,5 +596,3 @@ node D:\Tempfile\dsh-memory-tiers\tools\repair-sessions.mjs --apply   # 补 id�
     而「模型与阶段」「现在怎么样」显示的是运行值——两处不一致是**正确行为**，不是 bug（见 `docs/CONFIG-PAGE.md`）。
 13. **本手册的验证范围**是「插件自己的读写/注入/压缩」。dsh 版本差异（服务名、事件字段）只能通过 §4.2 的 `boot.errors` 和 §5 的现象暴露出来——遇到就记 BLOCKED/FAIL，附证据，不要改代码。
 14. `tools/` 和 `test/` 不在发布包里（`core/` 之外），它们不参与 dsh 装载。
-
-

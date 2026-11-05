@@ -208,7 +208,9 @@ export async function compactSurface(session, mem, opts = {}) {
     archived = res.ids?.length || 0
   }
 
-  const placeholder = `（此前 ${plan.rounds} 轮对话已归档到长期记忆，需要细节时检索即可）`
+  // 固定锚点：不带轮数、不带时间，保证它作为可缓存前缀的一部分逐轮稳定。
+  // DSH 只支持 surfaceOp: replace，没有删除操作；替换必须留一条消息当锚点。
+  const placeholder = '（历史已归档到长期记忆）'
   try {
     session.append('user/message', {
       role: 'user',
@@ -936,11 +938,56 @@ export function apply(ctx, patchConfig = {}) {
 
   // ── ⑤ 注入 ──
   // injection.reason：最近一次没注入的原因（work-mode / session-exempt / inject-disabled），页面和 /memory 用得到
-  const injection = { mode: 'none', ok: false, reason: null }
+  const injection = { mode: 'none', ok: false, reason: null, order: null }
 
   const sidFromAssembly = (asm) => {
     const id = asm?.agent?.session?.id ?? asm?.agent?.sessionId ?? asm?.sessionId ?? null
     return id ? String(id) : null
+  }
+
+  /**
+   * DSH 默认把本轮 runtime-context 快照追加在 decision.messages 末尾，
+   * 也就是用户消息之后——快照再稳定也进不了可复用前缀。
+   * 这里在消息落地前把快照移到最前，等价于宿主的「快照先于本轮输入」。
+   * 未来 DSH 自己修好后，快照已在最前，本函数自然 no-op。
+   */
+  const shouldMoveRuntimeContext = (payload) => {
+    try {
+      if (personaText().length > 0) return true
+      if (runCfg.inject?.enabled === false) return false
+      const sid = sidFromAssembly(payload)
+      const mode = sid ? modeOf(sid) : (globalWorkDefault() ? 'work' : 'normal')
+      return mode !== 'work' && mode !== 'exempt'
+    } catch { return false }
+  }
+
+  /**
+   * 技能目录（skill-catalog）是 dsh-tool-skill 每轮 append 到消息末尾的一条用户消息。
+   * 它内容稳定（只有技能增删改才变），但位置落在「用户消息之后」：
+   * 用户消息长度每轮不同 → 目录的 token 起点每轮漂移 → 整段 1576 字重付。
+   * 它不像记忆块那样随对话增长，可以安全地贴到系统提示后面，和快照一起前置。
+   */
+  const moveRuntimeContextFirst = async (payload, next) => {
+    const decision = await next()
+    if (!decision || decision.kind !== 'enter' || !Array.isArray(decision.messages)) return decision
+    if (!shouldMoveRuntimeContext(payload)) return decision
+    const isRc = (m) => m?.source?.kind === 'runtime-context'
+    const isCatalog = (m) => m?.source?.kind === 'skill-catalog'
+    const ctx = decision.messages.filter(isRc)
+    const catalog = decision.messages.filter(isCatalog)
+    if (ctx.length === 0 && catalog.length === 0) return decision
+    if (ctx[0] === decision.messages[0] && catalog.length === 0) return decision
+    const rest = decision.messages.filter((m) => !isRc(m) && !isCatalog(m))
+    if (catalog.length > 0) {
+      const len = catalog.reduce((n, m) => {
+        const c = m?.content
+        if (typeof c === 'string') return n + c.length
+        if (Array.isArray(c)) return n + c.reduce((k, p) => k + (typeof p?.text === 'string' ? p.text.length : 0), 0)
+        return n
+      }, 0)
+      audit('INJECT_ORDER', `skill-catalog-first count=${catalog.length} chars=${len}`)
+    }
+    return { ...decision, messages: [...catalog, ...ctx, ...rest] }
   }
 
   /**
@@ -971,6 +1018,23 @@ export function apply(ctx, patchConfig = {}) {
     }
   }
 
+  /**
+   * 记忆块放在「稳定环境段之后、WEB_SURFACE（端口/URL）之前」：
+   * 端口重启会变，放在记忆块之后，避免重启时连带丢掉整块记忆缓存；
+   * 其余环境段（100–200）稳定，放在记忆块之前可被缓存。
+   */
+  const memoryContextOrder = (svc) => {
+    try {
+      if (typeof svc?.getContextOrder === 'function') {
+        const web = svc.getContextOrder('WEB_SURFACE')
+        if (Number.isFinite(web)) return web - 5
+        const harness = svc.getContextOrder('HARNESS_SOURCE')
+        if (Number.isFinite(harness)) return harness + 5
+      }
+    } catch { /* 旧宿主没有该表 */ }
+    return 205
+  }
+
   const injectBlock = (c, svcArg) => {
     const svc = svcArg || c?.systemPrompt || ctx.systemPrompt
     if (!svc) throw new Error('没有 systemPrompt 服务')
@@ -978,22 +1042,35 @@ export function apply(ctx, patchConfig = {}) {
     // 这样按会话切换、保存配置热改都能立刻生效，不需要重载插件。
     const personaFn = () => personaText()
     if (typeof svc.context === 'function') {
-      svc.context({ name: 'memory-tiers-persona', order: 200, text: personaFn, interpolate: false })
-      svc.context({ name: 'memory-tiers', order: 250, text: (asm) => buildInjectedBlock(asm), interpolate: false })
+      // 90：人格紧跟系统提示；205（动态）：稳定环境段之后、端口块之前。
+      svc.context({ name: 'memory-tiers-persona', order: 90, text: personaFn, interpolate: false })
+      svc.context({ name: 'memory-tiers', order: memoryContextOrder(svc), text: (asm) => buildInjectedBlock(asm), interpolate: false })
       injection.mode = 'context'
     } else if (typeof svc.section === 'function') {
-      svc.section({ name: 'memory-tiers-persona', order: 10150, text: personaFn, interpolate: false })
-      svc.section({ name: 'memory-tiers', order: 10300, text: (asm) => buildInjectedBlock(asm), interpolate: false })
+      // 旧宿主没有 context() 时才走 section；排在第一方段落之后，避免插在中间。
+      svc.section({ name: 'memory-tiers-persona', order: 20000, text: personaFn, interpolate: false })
+      svc.section({ name: 'memory-tiers', order: 20100, text: (asm) => buildInjectedBlock(asm), interpolate: false })
       injection.mode = 'section'
     } else {
       throw new Error('systemPrompt 既没有 context() 也没有 section()')
     }
     injection.ok = true
+    injection.order = 'before-user'
     // 挂载状态落一次；具体会话为什么没注入由 /session 与 /memory context 查。
-    writeStatus(env, { inject: { enabled: true, mode: injection.mode, ok: true, reason: null } })
+    writeStatus(env, { inject: { enabled: true, mode: injection.mode, order: injection.order, ok: true, reason: null } })
     audit('INJECT_ON', injection.mode)
   }
   withService('systemPrompt', injectBlock)
+
+  // 把 runtime-context 快照提前到本轮所有消息之前；prepend 保证在其它 pre-step 监听之后执行。
+  step('inject-order', () => {
+    if (typeof ctx.on !== 'function') throw new Error('ctx.on 不可用')
+    const register = () => ctx.on('agent/pre-step', moveRuntimeContextFirst, { prepend: true })
+    if (typeof ctx.effect === 'function') ctx.effect(register, 'memory-tiers: inject order')
+    else register()
+    audit('INJECT_ORDER', 'runtime-context-before-user')
+    return true
+  })
 
   // ── ⑤.5 热改 + 会话接口的公共逻辑 ──
   /** 把保存后的配置里「能热改的字段」换进运行态；重载字段保留旧值，交给页面标「待重载」。 */
@@ -1136,13 +1213,14 @@ export function apply(ctx, patchConfig = {}) {
             ? ` · 注册/配置类 ${regMsgs.length} 条（不写入）`
             : ''
           const modeNote = sid ? ` · 当前会话 ${sessionModeLabel(sid)}` : ''
-          const head = `系统提示 ${sysChars.toLocaleString()} 字 · 本轮人格 ${persona.length.toLocaleString()} 字 · 本轮记忆块 ${blockNote} · 其余 ${rest.length} 条 / ${restChars.toLocaleString()} 字${modeNote}${histNote}${regNote}`
+          const head = `系统提示 ${sysChars.toLocaleString()} 字 · 本轮人格 ${persona.length.toLocaleString()} 字 · 本轮记忆块 ${blockNote} · 落位：本轮用户消息之前 · 其余 ${rest.length} 条 / ${restChars.toLocaleString()} 字${modeNote}${histNote}${regNote}`
           // 文件里完整呈现：系统提示全文 + 人格 + 记忆块 + 历史残留 + 其余消息原样。
           // 注册类只在头部提示，不写入。
           const dump = [
             `【系统提示 · ${sysChars.toLocaleString()} 字】`,
             sysText,
             '',
+            '【落位：以下人格与记忆块在本轮用户消息之前】',
             `【本轮将注入的人格 · ${persona.length.toLocaleString()} 字】`,
             persona || '（未配置人格）',
             '',
@@ -1239,7 +1317,7 @@ export function apply(ctx, patchConfig = {}) {
     dataDir,
     writer,
     boot,
-    inject: { enabled: runCfg.inject.enabled !== false, mode: injection.mode, ok: injection.ok, reason: injection.reason },
+    inject: { enabled: runCfg.inject.enabled !== false, mode: injection.mode, order: injection.order, ok: injection.ok, reason: injection.reason },
     capture: captureEnabled(),
     compaction: { enabled: runCfg.compaction.enabled !== false, keepTurns: Number(runCfg.compaction.keepTurns) || 0 },
     workMode: {

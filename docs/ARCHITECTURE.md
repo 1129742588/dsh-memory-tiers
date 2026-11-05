@@ -1,4 +1,4 @@
-# 架构文档（ARCHITECTURE）—— 详细版
+﻿# 架构文档（ARCHITECTURE）—— 详细版
 
 > 面向要**理解、维护、移植**本插件的开发者。当前参考实现是 dsh 端（cordis 插件协议），
 > 移植目标（astrbot）只需要替换「宿主适配层」（§9），引擎与协议层（§3–§7）应当原样保留。
@@ -73,7 +73,7 @@ tools/
   collect-report.mjs      崩溃取证打包
   seed.mjs                冒烟种子库
   star.mjs                星图开发 CLI（薄包装 core/star.mjs）
-test/                     72 项单测（node --test）
+test/                     76 项单测（node --test）
 ```
 
 ---
@@ -279,7 +279,8 @@ parts = []
 | memory | `createMemory`（引擎实例） | ✅ 原样 |
 | tools | 注册 5 个 `memory_*` 工具 | astrbot 工具/函数调用注册 |
 | capture | 订阅 `turn/end` 抓取（工作模式走骨架） | astrbot 消息钩子 |
-| systemPrompt | `context()` 挂人格(order 200) + 记忆块(order 250) | astrbot 的 system prompt 注入点 |
+| systemPrompt | `context()` 挂人格(order 90) + 记忆块(order = `WEB_SURFACE - 5`，通常 205) | astrbot 的 system prompt 注入点 |
+| inject-order | `agent/pre-step` 把 runtime-context 快照移到本轮消息之前 | astrbot 的请求前重排 |
 | inject:webServer | 配置页/会话/星图 API 挂载 | astrbot 面板路由 |
 | commands | 注册 `/memory` 命令 | astrbot 指令系统 |
 | timers | organize 定时器 + 卸载清理 | 定时任务 |
@@ -288,7 +289,15 @@ parts = []
 
 **web API**（配置页/星图/会话标记数据源）：`GET /dsh-memory/api/config`、`GET /dsh-memory/api/state`、`GET /dsh-memory/api/log`、`POST /dsh-memory/api/organize`、`GET /dsh-memory/api/sessions`、`GET/POST /dsh-memory/api/session`、`GET /dsh-memory/star`、`GET /dsh-memory/star/data`。
 
-**注入方式**：人格（context order 200）和记忆块（order 250）作为两条 `runtime-context` 消息进请求（宿主动态拼接）——注意 `deriveMessages()` **不含**注入块，调试「原样请求」只能靠 session 落盘数据或 `mem.buildBlock()` 正向构建。人格 provider 为空时 DSH 不贡献内容。
+**注入方式**：人格（context order 90）和记忆块（order = `WEB_SURFACE - 5`，通常 205）先合并成一条 `runtime-context` 快照；DSH 默认把这条快照追加在 `decision.messages` 末尾（用户消息之后），`inject-order` 在 `agent/pre-step` 水位把它移到最前，实际顺序变成：
+
+```
+system/message → 固定压缩锚点（普通模式）→ skill-catalog → runtime-context（人格 90 → 稳定环境段 100–200 → 记忆块 205 → web_surface 210）→ user/message → time-context
+```
+
+`skill-catalog` 由 `dsh-tool-skill` 在 pre-step 末尾 append（`[...decision.messages, catalog]`），天然落在用户消息之后；用户消息长度每轮不同，目录的 token 起点随之漂移，整段（约 1,576 字）每轮重付。它内容稳定、不随对话增长，所以 `inject-order` 把它一并提到快照之前，紧贴系统提示。
+
+注意 `deriveMessages()` **不含**注入块，调试「原样请求」只能靠 session 落盘数据或 `mem.buildBlock()` 正向构建。人格 provider 为空时 DSH 不贡献内容。未来 DSH 自己把快照提前后，`inject-order` 自动 no-op。
 
 **会话模式**：`sessions.json` 记录 `workMode/everWorked/turns`；`resolveSessionMode()` 单点判定 `work/exempt/normal`。注入与压缩都读同一个判定：`work`/`exempt` 跳过注入和历史替代，抓取用工作模式容量与骨架。全局 `workMode.enabled` 只是新会话默认值。
 

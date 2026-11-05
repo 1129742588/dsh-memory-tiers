@@ -24,7 +24,7 @@ dsh-memory-tiers 用六层记忆把这两个问题一起解决：
 # 在 dsh 插件管理器中安装 npm 包 dsh-memory-tiers
 
 # 方式二：GitHub
-# 从 https://github.com/1129742588/dsh-memory-tiers 的 tag v1.3.0 安装
+# 从 https://github.com/1129742588/dsh-memory-tiers 的 tag v1.3.1 安装
 
 # 方式三：dsh 市场搜索 dsh-memory-tiers
 ```
@@ -37,7 +37,7 @@ dsh-memory-tiers 用六层记忆把这两个问题一起解决：
 
 | 命令 | 作用 |
 |---|---|
-| `/memory context [all]` | 把**发给模型的完整上下文**（系统提示全文 + 人格 + 记忆块 + 全部消息）写成文本文件，方便核对与调试；`all` 直接在聊天里刷出 |
+| `/memory context [all]` | 把**发给模型的完整上下文**（系统提示全文 + 人格 + 记忆块 + 全部消息）写成文本文件，方便核对与调试；人格/记忆块实际落在本轮用户消息之前；`all` 直接在聊天里刷出 |
 | `/memory list` | 分层列出当前记忆库（id / 时间 / 通道 / 重要度 / 正文） |
 
 ### 模型工具（模型自主调用）
