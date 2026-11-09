@@ -55,6 +55,34 @@ export function expandHome(p, env = process.env) {
   return s
 }
 
+/**
+ * 解析 `inject.excludeDirs`：多行文本，每行一个目录前缀（`~` 开头会展开）。
+ * 归一化：`\` → `/`、去掉末尾 `/`；不是绝对路径的行忽略（相对路径对不上绝对的会话 cwd）。
+ */
+export function parseExcludeDirs(raw, env = process.env) {
+  const lines = Array.isArray(raw) ? raw : String(raw || '').split(/\r?\n/)
+  const out = []
+  for (const line of lines) {
+    const p = expandHome(String(line ?? ''), env).replace(/\\/g, '/').replace(/\/+$/, '')
+    if (p && isAbsolute(p) && !out.includes(p)) out.push(p)
+  }
+  return out
+}
+
+/**
+ * 会话工作目录是否命中排除前缀。
+ * 按路径段边界匹配：`/a/bots` 命中 `/a/bots/x`，不命中 `/a/botsX`；
+ * 工作目录恰等于前缀（末尾 `/` 可有可无）也算命中。空列表恒不命中。
+ */
+export function isExcludedCwd(cwd, dirs) {
+  const wd = String(cwd || '').replace(/\\/g, '/').replace(/\/+$/, '')
+  if (!wd || !Array.isArray(dirs) || dirs.length === 0) return false
+  return dirs.some((raw) => {
+    const d = String(raw || '').replace(/\\/g, '/').replace(/\/+$/, '')
+    return d.length > 0 && (wd === d || wd.startsWith(d + '/'))
+  })
+}
+
 /** 数据目录：配置里的 storage.dir 优先，空则用默认值 */
 export function resolveDataDir(cfg, env = process.env) {
   const raw = expandHome(cfg?.storage?.dir, env)
@@ -134,6 +162,11 @@ export const SCHEMA = [
     group: '注入', path: 'inject.maxChars', type: 'number', default: 0, min: 0, max: 200000, step: 500,
     label: '注入总量上限（字）',
     hint: '0 = 不限制，由下面 L1/L2/L3 各自容量决定。填了就在总字数上再压一道（按整行裁）。',
+  },
+  {
+    group: '注入', path: 'inject.excludeDirs', type: 'textarea', default: '', wide: true,
+    label: '按会话工作目录排除注入',
+    hint: '每行一个绝对路径前缀（`~` 开头会展开）。命中会话工作目录的会话不注入记忆块，也不替换历史（保持 dsh 原生历史，避免「历史被替成占位、记忆又没注入」）。留空 = 所有会话都注入，行为与原版完全一致。',
   },
 
   // —— 六层容量（第 2/4 步的闸门）——
@@ -500,6 +533,12 @@ export function normalize(raw, env = process.env) {
     warnings.push({ path: 'workMode.enabled', error: '全局默认工作模式开启：新会话默认不注入、不压缩历史；单个会话可在输入框旁切换。本项需重载插件才对新的默认值生效。' })
   } else if (getPath(config, 'inject.enabled') === false && getPath(config, 'compaction.keepTurns') === 0) {
     warnings.push({ path: 'inject.enabled', error: '注入关着、历史又全部替换：模型将看不到任何历史与记忆' })
+  }
+  // 按目录排除注入：不是绝对路径的前缀永远匹配不上（会话 cwd 是绝对路径），提前说一声
+  const badExclude = String(getPath(config, 'inject.excludeDirs') || '')
+    .split(/\r?\n/).map((s) => expandHome(s, env)).filter((s) => s && !isAbsolute(s))
+  if (badExclude.length) {
+    warnings.push({ path: 'inject.excludeDirs', error: `不是绝对路径，不会生效：${badExclude.join('、')}` })
   }
 
   // 未知字段：保留（向前兼容），但要知道它们不起作用

@@ -34,6 +34,7 @@ import {
   loadSessions, saveSessions, resolveSessionMode, setSessionWorkMode,
   clearSessionExemption, recordSessionTurn, sessionStats,
   SCHEMA, getPath, setPath, isReloadPath,
+  parseExcludeDirs, isExcludedCwd,
 } from './settings.mjs'
 
 export const name = 'memory-tiers'
@@ -404,6 +405,19 @@ export function apply(ctx, patchConfig = {}) {
     return inject && compaction ? '记忆接管' : '普通'
   }
   if (globalWorkDefault()) audit('WORK_MODE', 'global-default=on')
+
+  // ── 注入排除（按会话工作目录前缀）──
+  // 会话 cwd 命中 `inject.excludeDirs` 的会话：不注入记忆块、不替换历史（保持 dsh 原生历史）。
+  // 为什么还要跳压缩：1.3.x 默认 keepTurns=0 会把历史整个换成占位，记忆块又被排除 = 模型什么都看不到。
+  // 默认空列表 → 全部不命中，行为与原版完全一致。
+  const excludeDirs = () => parseExcludeDirs(runCfg.inject?.excludeDirs, env)
+  const cwdOf = (obj) => String(
+    obj?.agent?.session?.header?.cwd || obj?.agent?.session?.cwd || obj?.header?.cwd || '',
+  ).replace(/\\/g, '/')
+  const isInjectExcluded = (obj) => {
+    const dirs = excludeDirs()
+    return dirs.length > 0 && isExcludedCwd(cwdOf(obj), dirs)
+  }
 
   // ── ①.8 人格槽位 ──
   // 配置正文 + 其它插件注册的片段；按 (order, id) 确定性拼接，逐字稳定。
@@ -812,6 +826,8 @@ export function apply(ctx, patchConfig = {}) {
       audit('COMPACT_SKIP', `reason=session-${mode}`)
       return null
     }
+    // 按目录排除的会话：不替换历史（记忆块也不注入，替掉就等于让模型失忆）
+    if (isInjectExcluded(sessionObj)) { audit('COMPACT_SKIP', 'reason=cwd-excluded'); return null }
     if (runCfg.compaction.enabled === false) return null
     if (!sessionObj) return null
     if (runCfg.inject.enabled === false && (Number(runCfg.compaction.keepTurns) || 0) === 0) {
@@ -937,7 +953,7 @@ export function apply(ctx, patchConfig = {}) {
   })
 
   // ── ⑤ 注入 ──
-  // injection.reason：最近一次没注入的原因（work-mode / session-exempt / inject-disabled），页面和 /memory 用得到
+  // injection.reason：最近一次没注入的原因（work-mode / session-exempt / inject-disabled / cwd-excluded），页面和 /memory 用得到
   const injection = { mode: 'none', ok: false, reason: null, order: null }
 
   const sidFromAssembly = (asm) => {
@@ -957,7 +973,9 @@ export function apply(ctx, patchConfig = {}) {
       if (runCfg.inject?.enabled === false) return false
       const sid = sidFromAssembly(payload)
       const mode = sid ? modeOf(sid) : (globalWorkDefault() ? 'work' : 'normal')
-      return mode !== 'work' && mode !== 'exempt'
+      if (mode === 'work' || mode === 'exempt') return false
+      // 被目录排除的会话没有记忆块，不替它调消息顺序（插件不接管这些会话的上下文）
+      return !isInjectExcluded(payload)
     } catch { return false }
   }
 
@@ -1004,6 +1022,8 @@ export function apply(ctx, patchConfig = {}) {
     if (mode === 'work') { injection.reason = 'work-mode'; return '' }
     if (mode === 'exempt') { injection.reason = 'session-exempt'; return '' }
     if (runCfg.inject.enabled === false) { injection.reason = 'inject-disabled'; return '' }
+    // 会话 cwd 命中 inject.excludeDirs：这些会话不归记忆接管（不注入、不替换历史）
+    if (isInjectExcluded(asm)) { injection.reason = 'cwd-excluded'; return '' }
     injection.reason = null
     try {
       return mem.buildBlock(Number(runCfg.inject.maxChars) || 0, {
@@ -1194,7 +1214,7 @@ export function apply(ctx, patchConfig = {}) {
           // ★ 注入块由插件自己按当前库实时构建（deriveMessages 里没有它，原因见 buildInjectedBlock 的注释）。
           const sid = ses?.id ? String(ses.id) : null
           const persona = personaText()
-          const block = buildInjectedBlock(null, sid)
+          const block = buildInjectedBlock(ses, sid)
           const blockReason = injection.reason
           const reasonText = blockReason === 'work-mode'
             ? '工作模式开启：不注入记忆'
@@ -1202,7 +1222,9 @@ export function apply(ctx, patchConfig = {}) {
               ? '该会话已豁免记忆接管：不注入记忆'
               : blockReason === 'inject-disabled'
                 ? '注入已关闭'
-                : '注入开着，但库里还没有可注入的内容'
+                : blockReason === 'cwd-excluded'
+                  ? '该会话工作目录在排除列表（inject.excludeDirs）：不注入记忆'
+                  : '注入开着，但库里还没有可注入的内容'
           const blockNote = block
             ? `${block.length.toLocaleString()} 字`
             : `0 字（${reasonText}）`

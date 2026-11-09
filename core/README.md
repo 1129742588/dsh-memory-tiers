@@ -188,6 +188,18 @@ off()
 
 ---
 
+## 按目录排除注入（`inject.excludeDirs`）
+
+同一个 dsh 进程里可能同时跑「人用的会话」和「Bot / 子任务工作区会话」。后者通常有自己的任务书与记忆，不需要吃全局记忆；逐个会话去点工作模式又总有滞后（新会话还得再点一次）。配置页「注入」组的 **按会话工作目录排除注入** 就是给部署方用的：每行一个绝对路径前缀（`~` 开头会展开）。
+
+- 会话工作目录命中前缀的会话：**不注入记忆块**、**不替换历史**（保持 dsh 原生历史），日志 `COMPACT_SKIP reason=cwd-excluded`、`injection.reason=cwd-excluded`，`/memory context` 会写明原因；
+- 为什么连历史替换也跳过：默认 `compaction.keepTurns=0` 会把历史整个换成占位，这些会话又没有记忆块——一压就等于模型什么都看不到；
+- 前缀按**路径段边界**匹配：`/a/bots` 命中 `/a/bots/x`，不命中 `/a/botsX`；末尾 `/` 可写可不写；Windows 路径也会归一成 `/`；
+- 留空（默认）= 所有会话都注入、都被接管，**行为与原版完全一致**；
+- 只影响「读」：命中排除的会话，回合照常写进 L1（反向写入隔离是另一个方向）；人格、工具与 `/memory` 命令不受影响。
+
+---
+
 ## 排障
 
 先看两个文件：
@@ -201,7 +213,7 @@ off()
 
 | 现象 | 先看 |
 |---|---|
-| 模型想不起以前的事 | `status.json` 的 `inject.mode`；日志里有没有 `INJECT_ON`。没挂上 = 注入失败；`inject.reason=work-mode` = 工作模式 |
+| 模型想不起以前的事 | `status.json` 的 `inject.mode`；日志里有没有 `INJECT_ON`。没挂上 = 注入失败；`inject.reason=work-mode` = 工作模式；`inject.reason=cwd-excluded` = 命中 `inject.excludeDirs` |
 | 设置页打不开/空白 | `/dsh-memory/api/config` 返回 404 就是没挂上；看 `BOOT_MISSING webServer` |
 | 语义检索不见了 | 日志 `NO_KEY` / `MODEL_FAIL stage=embed`：没 key 或 key 失效（这时只走关键词） |
 | 一直不整理 | 看 `status.json` 的六层条数与配置里的 `hotChars`：L1 没到容量就不会分流（1.2.0 起不再等安静期） |
@@ -209,7 +221,7 @@ off()
 | 摘要不产生 | 日志 `MODEL_MISSING classify` / `DIGEST_FALLBACK`：模型不可用，原文会留在 L2/DL1 等下一轮 |
 | 摘要一直是 0 条 | 日志 `DIGEST_EMPTY[l1]`：模型没给 `★` 也没给 `+`（两阶段规则见上） |
 | DL1 一直涨 | 看 `DL1_TRIM`（到上限被清）与 `FORGET`（曲线清理）；上限是 `layers.dl1MaxChars` |
-| 历史没被替换/没注入 | 日志 `COMPACT_SKIP reason=session-work|session-exempt`、`INJECT_OFF` 或 `/session` 接口：该会话处于工作模式或已豁免 |
+| 历史没被替换/没注入 | 日志 `COMPACT_SKIP reason=session-work|session-exempt|cwd-excluded`、`INJECT_OFF` 或 `/session` 接口：该会话处于工作模式/已豁免，或工作目录命中 `inject.excludeDirs` |
 | 星图打不开/空白 | `/dsh-memory/star` 返回 404 = 接口没挂上；看 `BOOT_MISSING webServer`；数据不对看日志 `STAR_FAIL` |
 | 会话状态标记不出现 | 宿主没有 `conversation.input.right` slot 时只少标记；设置页「会话模式与接管豁免」仍可用 |
 | 配置保存了但没生效 | 看保存提示：热改项应显示「立即生效」；模型/存储/全局工作模式/定时器间隔会标「需重载」 |
