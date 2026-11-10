@@ -524,7 +524,7 @@ export function createSessionCaller(getCtx, opts = {}) {
         break
       }
     }
-    if (failure) throw new Error(String(failure?.failure?.message ?? failure?.message ?? '会话模型调用失败'))
+    if (failure) throw new Error(failureDetail(failure))
     return { text: text.trim(), provider: sel.provider, model: sel.model }
   }
 
@@ -537,6 +537,26 @@ export function createSessionCaller(getCtx, opts = {}) {
   }
 
   return { available, selection, call, info }
+}
+
+/**
+ * 把终止块里的失败详情拼成一句能定位问题的话。
+ *
+ * DSH 的形状是 { type:'finish', reason:{ kind:'error'|'aborted', failure:{ message, code, status } } }，
+ * 详情在 reason.failure 上；顶层 failure / error 是别的版本或别的通道可能用的形状，一并兜住。
+ * 以前只读 chunk.failure?.message —— 永远落空，于是日志里只剩一句「会话模型调用失败」，
+ * 真正的原因（NO_ADAPTER / AUTH 401 / ABORTED）全被吞掉，看着像网络问题。
+ */
+function failureDetail(chunk) {
+  const reason = chunk?.reason ?? null
+  const f = reason?.failure ?? chunk?.failure ?? chunk?.error ?? null
+  const message = (typeof f === 'string' ? f : f?.message) ?? ''
+  const code = (typeof f === 'string' ? '' : f?.code) ?? reason?.code ?? ''
+  const status = Number.isInteger(f?.status) ? f.status : null
+  const kind = reason?.kind ?? ''
+  const tag = [code, status !== null ? `HTTP ${status}` : ''].filter(Boolean).join(' ')
+  const text = String(message).trim() || `会话模型调用失败${kind ? `（${kind}）` : ''}`
+  return tag ? `${text} [${tag}]` : text
 }
 
 // ============================================================
